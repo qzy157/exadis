@@ -105,6 +105,7 @@ struct MobilityBCC0b_temp
 
         double Tm = 1589.0 + 273.15;
         double T  = kT * pstrain + bT;
+        if (T <= 0.0) T = 1.0; // guard: bT must be a positive initial temperature (K)
         double kB = 8.617333262145e-5; // eV/K
 
         if (tau_rss >= tau_p) {
@@ -119,10 +120,9 @@ struct MobilityBCC0b_temp
     KOKKOS_INLINE_FUNCTION
     double compute_Bedge(double pstrain)
     {
-        double A  = 1e-7;
-        double Tm = 1589.0 + 273.15;
-        double T  = kT * pstrain + bT;
-        (void)Tm;
+        double A = 1e-7;
+        double T = kT * pstrain + bT;
+        if (T <= 0.0) T = 1.0;
         return A * T;
     }
 
@@ -192,9 +192,7 @@ struct MobilityBCC0b_temp
                 double costheta  = dot(dr, burg);
                 double costheta2 = (costheta * costheta) * invbMag2;
 
-                double dangle    = 1.0 / bMag * fabs(costheta);
-                double fricStress = Fedge + (Fscrew - Fedge) * dangle;
-                FricForce += fricStress * bMag * mag;
+                double dangle = 1.0 / bMag * fabs(costheta);
 
                 double Bscrew    = compute_Bscrew(pstrain, fi.norm() / bMag / mag);
                 double Bscrew2   = Bscrew * Bscrew;
@@ -224,7 +222,9 @@ struct MobilityBCC0b_temp
                         Btotal[2][2] += halfMag * (dr.z*dr.z * BlmBecl + Beclimbj);
                     }
                 } else {
-                    // Non-[0 0 1] arm: start with screw drag
+                    // Non-[0 0 1] arm: friction and screw drag
+                    double fricStress = Fedge + (Fscrew - Fedge) * dangle;
+                    FricForce += fricStress * bMag * mag;
                     Btotal[0][0] += halfMag * (dr.x*dr.x * BlmBsc + Bscrew);
                     Btotal[0][1] += halfMag * (dr.x*dr.y * BlmBsc);
                     Btotal[0][2] += halfMag * (dr.x*dr.z * BlmBsc);
