@@ -61,6 +61,7 @@ void System::initialize(Params _params, Crystal _crystal, SerialDisNet *network)
     dEp.zero();
     dWp.zero();
     realdt = 0.0;
+    pstrain = 0.0;
     density = network->dislocation_density(params.burgmag);
     
     // Create oprec

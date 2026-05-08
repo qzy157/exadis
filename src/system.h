@@ -40,7 +40,8 @@ public:
     double realdt;
     Mat33 dEp, dWp;
     double density;
-    
+    double pstrain;
+
     Params params;
     Crystal crystal;
     
