@@ -29,11 +29,19 @@ template<class F>
 class CrossSlipParallel : public CrossSlip {
 private:
     F* force;
-    
+
 public:
+    BCCCrossSlipParams bcc_params;
+
     CrossSlipParallel(System* system, Force* _force)
     {
-        // Check and assign force kernel
+        force = dynamic_cast<F*>(_force);
+        if (force == nullptr)
+            ExaDiS_fatal("Error: inconsistent force type in CrossSlipParallel\n");
+    }
+    CrossSlipParallel(System* system, Force* _force, BCCCrossSlipParams _bcc_params)
+        : bcc_params(_bcc_params)
+    {
         force = dynamic_cast<F*>(_force);
         if (force == nullptr)
             ExaDiS_fatal("Error: inconsistent force type in CrossSlipParallel\n");
@@ -62,37 +70,41 @@ public:
         DeviceDisNet* net;
         F* force;
         NeighborList* neilist;
-        
+
         double eps, thetacrit, sthetacrit, s2thetacrit;
         double shearModulus, areamin;
         double noiseFactor, weightFactor;
-        
+
         Mat33 R, Rinv;
-        
+        BCCCrossSlipParams bcc_params;
+        double pstrain;
+
         Kokkos::View<int*, T_memory_shared> count;
         Kokkos::View<int*, T_memory_space> csnodes;
         Kokkos::View<CrossSlipEvent*, T_memory_shared> events;
-        
-        FindCrossSlipEvents(System* _system, DeviceDisNet* _net, F* _force) :
-        system(_system), net(_net), force(_force)
+
+        FindCrossSlipEvents(System* _system, DeviceDisNet* _net, F* _force,
+                            BCCCrossSlipParams _bcc_params = BCCCrossSlipParams()) :
+        system(_system), net(_net), force(_force), bcc_params(_bcc_params)
         {
             eps = 1e-6;
             if (system->crystal.type == FCC_CRYSTAL)
                 thetacrit = 2.0 / 180.0 * M_PI;
             else if (system->crystal.type == BCC_CRYSTAL)
-                thetacrit = 0.5 / 180.0 * M_PI;
+                thetacrit = 15.0 / 180.0 * M_PI;
             sthetacrit = sin(thetacrit);
             s2thetacrit = sthetacrit * sthetacrit;
             shearModulus = system->params.MU;
-            
+
             areamin = 2.0 * system->params.rtol * system->params.maxseg;
             areamin = MIN(areamin, system->params.minseg * system->params.minseg * sqrt(3.0) / 4.0);
-            
+
             noiseFactor = 1e-5;
             weightFactor = 1.0;
-            
+
             R = system->crystal.R;
             Rinv = system->crystal.Rinv;
+            pstrain = system->pstrain;
         }
         
         KOKKOS_INLINE_FUNCTION
@@ -332,11 +344,46 @@ public:
                 fplane = (fabs(tmp3C[j]) > fabs(tmp3C[fplane])) ? j : fplane;
             }
             
+            // BCC: thermally-activated cross-slip criterion (same model as serial)
+            bool bcc_bothseg_ok = false;
+            if (system->crystal.type == BCC_CRYSTAL && bothseg_are_screw && (plane1 == plane2) &&
+                bcc_params.tau_P_cs > 0.0 && bcc_params.L0_ref > 0.0 && bcc_params.eps_dot_exp > 0.0) {
+                double T = bcc_params.kT * pstrain + bcc_params.bT;
+                if (T <= 0.0) T = 1.0;
+                double L_avg = 0.5 * (L1 + L2);
+                Vec3 n_glide = cross(burg, glideDirLab[plane1]).normalized();
+                double tau_glide = dot(burg, system->extstress * n_glide);
+                double best_freq = 1.0;
+                int best_plane = -1;
+                for (int j = 0; j < numGlideDir; j++) {
+                    if (j == plane1) continue;
+                    Vec3 n_j = cross(burg, glideDirLab[j]).normalized();
+                    double tau_cs = dot(burg, system->extstress * n_j);
+                    if (tau_cs < tau_glide || tau_cs < bcc_params.tau_f_cs) continue;
+                    double ratio = tau_cs / bcc_params.tau_P_cs;
+                    double dG = 0.0;
+                    if (ratio < 1.0) {
+                        dG = bcc_params.delta_H_cs
+                             * pow(1.0 - pow(ratio, bcc_params.p_shape), bcc_params.q_shape)
+                             - T * bcc_params.delta_S_cs;
+                        if (dG < 0.0) dG = 0.0;
+                    }
+                    double omega_a = (bcc_params.eps_dot_sim / bcc_params.eps_dot_exp)
+                                     * bcc_params.omega_D;
+                    double freq = omega_a * (L_avg / bcc_params.L0_ref)
+                                  * exp(-dG / (8.617333e-5 * T));
+                    if (freq > best_freq) { best_freq = freq; best_plane = j; }
+                }
+                if (best_plane >= 0) { fplane = best_plane; bcc_bothseg_ok = true; }
+            }
+
             // Calculate the new plane in the lab frame
             Vec3 newplane = cross(burg, glideDirLab[fplane]).normalized();
-            
-            if (bothseg_are_screw && (plane1 == plane2) && (plane1 != fplane) &&
-                (fabs(tmp3C[fplane]) > (weightFactor*fabs(tmp3C[plane1])+fnodeThreshold))) {
+
+            if (bcc_bothseg_ok ||
+                (system->crystal.type != BCC_CRYSTAL &&
+                 bothseg_are_screw && (plane1 == plane2) && (plane1 != fplane) &&
+                 (fabs(tmp3C[fplane]) > (weightFactor*fabs(tmp3C[plane1])+fnodeThreshold)))) {
                 
                 // Both segments are close to screw and the average direction
                 // is close to screw.
@@ -553,7 +600,7 @@ public:
         DeviceDisNet* net = system->get_device_network();
         
         // Initialize the FindCrossSlipEvents structure
-        FindCrossSlipEvents* cs = exadis_new<FindCrossSlipEvents>(system, net, force);
+        FindCrossSlipEvents* cs = exadis_new<FindCrossSlipEvents>(system, net, force, bcc_params);
         
         // Identify nodes attached to screw segments that need
         // to be considered for a cross-slip event
