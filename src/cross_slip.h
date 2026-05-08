@@ -102,6 +102,28 @@ bool node_pinned(System* system, N* net, int i, int planeIndex,
     return 0;
 }
 
+/*---------------------------------------------------------------------------
+ *
+ *    Struct:       BCCCrossSlipParams
+ *                  Parameters for thermally-activated BCC cross-slip.
+ *                  Temperature model: T = kT * pstrain + bT (adiabatic heating).
+ *
+ *-------------------------------------------------------------------------*/
+struct BCCCrossSlipParams {
+    double kT          = 0.0;  // heating slope [K/strain]
+    double bT          = 300.0;// initial temperature [K]
+    double delta_H_cs  = 0.0;  // activation enthalpy at zero stress [eV]
+    double tau_P_cs    = 0.0;  // Peierls stress on cross-slip plane [Pa]
+    double p_shape     = 0.5;  // Kocks-Mecking shape parameter p
+    double q_shape     = 1.5;  // Kocks-Mecking shape parameter q
+    double delta_S_cs  = 0.0;  // activation entropy [eV/K]
+    double omega_D     = 0.0;  // Debye attempt frequency [s^-1]
+    double eps_dot_sim = 0.0;  // simulated strain rate [s^-1]
+    double eps_dot_exp = 0.0;  // experimental strain rate [s^-1]
+    double L0_ref      = 0.0;  // reference dislocation length [m]
+    double tau_f_cs    = 0.0;  // cross-slip plane friction stress [Pa]
+};
+
 } // namespace ExaDiS
 
 
