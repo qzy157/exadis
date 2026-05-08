@@ -600,7 +600,7 @@ public:
         DeviceDisNet* net = system->get_device_network();
         
         // Initialize the FindCrossSlipEvents structure
-        FindCrossSlipEvents* cs = exadis_new<FindCrossSlipEvents>(system, net, force, bcc_params);
+        FindCrossSlipEvents* cs = exadis_new<FindCrossSlipEvents>(system, net, force, this->bcc_params);
         
         // Identify nodes attached to screw segments that need
         // to be considered for a cross-slip event
