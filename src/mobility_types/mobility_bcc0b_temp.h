@@ -29,10 +29,8 @@ struct MobilityBCC0b_temp
 {
     bool non_linear = false;
     double Beclimbj;
-    double Bscrew2, Beclimb2;
-    double Bline, BlmBsc, BlmBecl;
-    double invBscrew2, invBedge2;
-    double Bedge, Bscrew, Beclimb;
+    double Beclimb2;
+    double Beclimb;
     double vmax, vscale;
     double Fedge, Fscrew;
     double kT, bT;
@@ -132,9 +130,9 @@ struct MobilityBCC0b_temp
     KOKKOS_INLINE_FUNCTION
     Vec3 node_velocity(System* system, N* net, const int& i, const Vec3& fi)
     {
-        double pstrain = system->pstrain;
-        Bedge     = compute_Bedge(pstrain);
-        invBedge2 = 1.0 / (Bedge * Bedge);
+        double pstrain  = system->pstrain;
+        double Bedge    = compute_Bedge(pstrain);
+        double invBedge2 = 1.0 / (Bedge * Bedge);
 
         auto nodes = net->get_nodes();
         auto segs  = net->get_segs();
@@ -198,12 +196,12 @@ struct MobilityBCC0b_temp
                 double fricStress = Fedge + (Fscrew - Fedge) * dangle;
                 FricForce += fricStress * bMag * mag;
 
-                Bscrew     = compute_Bscrew(pstrain, fi.norm() / bMag / mag);
-                Bscrew2    = Bscrew * Bscrew;
-                Bline      = 1.0e-2 * MIN(Bscrew, Bedge);
-                BlmBsc     = Bline - Bscrew;
-                BlmBecl    = Bline - Beclimbj;
-                invBscrew2 = 1.0 / (Bscrew * Bscrew);
+                double Bscrew    = compute_Bscrew(pstrain, fi.norm() / bMag / mag);
+                double Bscrew2   = Bscrew * Bscrew;
+                double Bline     = 1.0e-2 * MIN(Bscrew, Bedge);
+                double BlmBsc    = Bline - Bscrew;
+                double BlmBecl   = Bline - Beclimbj;
+                double invBscrew2 = 1.0 / Bscrew2;
 
                 if (bMag > 1.0 + eps) {
                     // [0 0 1] junction arms
