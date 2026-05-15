@@ -779,38 +779,39 @@ void remesh(ExaDisNet& disnet, RemeshBind& remeshbind)
  *    Cross-slip binding
  *
  *-------------------------------------------------------------------------*/
-CrossSlipBind make_cross_slip(std::string cross_slip_mode, Params& params, ForceBind& forcebind)
+CrossSlipBind make_cross_slip(std::string cross_slip_mode, Params& params, ForceBind& forcebind,
+                              BCCCrossSlipParams bcc_params = BCCCrossSlipParams())
 {
     System* system = make_system(new SerialDisNet(), Crystal(params.crystal), params);
-    
+
     Force* force = forcebind.force;
     double cutoff = forcebind.neighbor_cutoff; // required for force calculation
-    
+
     CrossSlip* crossslip;
     if (cross_slip_mode == "ForceBasedParallel") {
         if (forcebind.model == ForceBind::LINE_TENSION_MODEL) {
-            crossslip = new CrossSlipParallel<ForceType::LINE_TENSION_MODEL>(system, force);
+            crossslip = new CrossSlipParallel<ForceType::LINE_TENSION_MODEL>(system, force, bcc_params);
         } else if (forcebind.model == ForceBind::CUTOFF_MODEL) {
-            crossslip = new CrossSlipParallel<ForceType::CUTOFF_MODEL>(system, force);
+            crossslip = new CrossSlipParallel<ForceType::CUTOFF_MODEL>(system, force, bcc_params);
         } else if (forcebind.model == ForceBind::DDD_FFT_MODEL) {
-            crossslip = new CrossSlipParallel<ForceType::DDD_FFT_MODEL>(system, force);
+            crossslip = new CrossSlipParallel<ForceType::DDD_FFT_MODEL>(system, force, bcc_params);
         } else if (forcebind.model == ForceBind::SUBCYCLING_MODEL) {
-            crossslip = new CrossSlipParallel<ForceType::SUBCYCLING_MODEL>(system, force);
+            crossslip = new CrossSlipParallel<ForceType::SUBCYCLING_MODEL>(system, force, bcc_params);
         } else if (forcebind.model == ForceBind::GLOBAL_MODEL) {
-            crossslip = new CrossSlipParallel<ForceType::GLOBAL_MODEL>(system, force);
+            crossslip = new CrossSlipParallel<ForceType::GLOBAL_MODEL>(system, force, bcc_params);
         } else {
             ExaDiS_fatal("Error: invalid force type for CrossSlipParallel binding\n");
         }
-    } else if (cross_slip_mode == "ForceBasedSerial") {  
-        crossslip = new CrossSlipSerial(system, force);
-    } else if (cross_slip_mode == "None") { 
+    } else if (cross_slip_mode == "ForceBasedSerial") {
+        crossslip = new CrossSlipSerial(system, force, bcc_params);
+    } else if (cross_slip_mode == "None") {
         crossslip = new CrossSlip(system);
     } else {
         ExaDiS_fatal("Error: invalid cross-slip mode %s\n", cross_slip_mode.c_str());
     }
-    
+
     exadis_delete(system);
-    
+
     return CrossSlipBind(crossslip, params, cutoff);
 }
 
@@ -1238,11 +1239,27 @@ PYBIND11_MODULE(pyexadis, m) {
           py::arg("net"), py::arg("remesh"));
     
     // Cross-slip
+    py::class_<BCCCrossSlipParams>(m, "CrossSlipSerial_BCCParams")
+        .def(py::init<>())
+        .def_readwrite("kT",          &BCCCrossSlipParams::kT)
+        .def_readwrite("bT",          &BCCCrossSlipParams::bT)
+        .def_readwrite("delta_H_cs",  &BCCCrossSlipParams::delta_H_cs)
+        .def_readwrite("tau_P_cs",    &BCCCrossSlipParams::tau_P_cs)
+        .def_readwrite("p_shape",     &BCCCrossSlipParams::p_shape)
+        .def_readwrite("q_shape",     &BCCCrossSlipParams::q_shape)
+        .def_readwrite("delta_S_cs",  &BCCCrossSlipParams::delta_S_cs)
+        .def_readwrite("omega_D",     &BCCCrossSlipParams::omega_D)
+        .def_readwrite("eps_dot_sim", &BCCCrossSlipParams::eps_dot_sim)
+        .def_readwrite("eps_dot_exp", &BCCCrossSlipParams::eps_dot_exp)
+        .def_readwrite("L0_ref",      &BCCCrossSlipParams::L0_ref)
+        .def_readwrite("tau_f_cs",    &BCCCrossSlipParams::tau_f_cs);
+
     py::class_<CrossSlipBind>(m, "CrossSlip")
         .def(py::init<>())
         .def("handle", &CrossSlipBind::handle, "Handle cross-slip operations of the system");
     m.def("make_cross_slip", &make_cross_slip, "Instantiate a cross-slip class",
-          py::arg("cross_slip_mode"), py::arg("params"), py::arg("force"));
+          py::arg("cross_slip_mode"), py::arg("params"), py::arg("force"),
+          py::arg("bcc_params") = BCCCrossSlipParams());
     m.def("handle_cross_slip", &handle_cross_slip, "Wrapper to handle cross-slip operations",
           py::arg("net"), py::arg("cross_slip"));
 
