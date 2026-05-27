@@ -421,13 +421,15 @@ void ExaDiSApp::update_mechanics(Control& ctrl)
         strain = dot(Etot, A);
         stress = dot(system->extstress, A);
         pstrain += dpstrain;
+        system->pstrain = pstrain;
     }
-    
+
     if (ctrl.loading == STRESS_CONTROL) {
         strain = 0.0;
         stress = von_mises(system->extstress);
         double dpstrain = von_mises(system->dEp);
         pstrain += dpstrain;
+        system->pstrain = pstrain;
     }
     
     tottime += system->realdt;
