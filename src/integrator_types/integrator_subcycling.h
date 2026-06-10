@@ -40,28 +40,28 @@ namespace ExaDiS {
  *-------------------------------------------------------------------------*/
 class ForceSubcycling : public Force {
 public:
-    typedef ForceType::CORE_SELF_PKEXT FSeg;
-    typedef ForceFFT FLong;
-    typedef ForceSegSegList<SegSegIsoFFT> FSegSeg;
+    typedef ForceType::CORE_SELF_PKEXT FSeg;//段自身的力
+    typedef ForceFFT FLong;//长程力
+    typedef ForceSegSegList<SegSegIsoFFT> FSegSeg;//短程的段-段相互作用力
     
     FSeg* fseg;
     FLong* flong;
     FSegSeg* fsegseg;
-    int Ngroups;
-    int group;
-    bool drift;
-    bool flong_group0;
+    int Ngroups;//这是子循环的组数，Ngroups-1个子循环组和一个主循环组
+    int group;//当前的组，-1表示不使用子循环，0表示主循环组，>0表示子循环组
+    bool drift;//drift=0(默认):原始子循环方案 ;drift=1:修改版。对 group > 0 的各组,节点力只是被存储起来(save_subforce),而不立即用于积分;只有选中 group 0 时,才把所有其他组的力累加起来并用于积分。这使得在每个子循环中都能在总力作用下进行积分，并且与任意（非线性）迁移率定律兼容。
+    bool flong_group0;//是否在 group 0 中计算长程力。默认值为 true，即在 group 0 中计算长程力。如果设置为 false，则在 group Ngroups-1 中计算长程力。
     
-    static const int Ngmax = MAXGROUPS;
-    Kokkos::View<Vec3*> fgroup[Ngmax-1];
+    static const int Ngmax = MAXGROUPS;//最大组数
+    Kokkos::View<Vec3*> fgroup[Ngmax-1];//每个子循环组的节点力，group 0 不需要存储，因为它直接作用在节点上
     
 public:
     struct Params {
-        FSeg::Params FSegParams;
-        FLong::Params FLongParams;
-        bool drift = false;
-        bool flong_group0 = true;
-        Params(int Ngrid) { FLongParams = FLong::Params(Ngrid); }
+        FSeg::Params FSegParams;//段力的参数
+        FLong::Params FLongParams;//长程力的参数
+        bool drift = false;//是否使用修改版的子循环方案，默认值为 false，即使用原始子循环方案
+        bool flong_group0 = true;//是否在 group 0 中计算长程力。默认值为 true，即在 group 0 中计算长程力。如果设置为 false，则在 group Ngroups-1 中计算长程力。
+        Params(int Ngrid) { FLongParams = FLong::Params(Ngrid); }//长程力的参数构造函数，接受一个整数参数 Ngrid，用于初始化 FLongParams
         Params(int Nx, int Ny, int Nz) { FLongParams = FLong::Params(Nx, Ny, Nz); }
         Params(int Ngrid, bool _drift, bool _flong_group0) {
             FLongParams = FLong::Params(Ngrid); drift = _drift; flong_group0 = _flong_group0;
