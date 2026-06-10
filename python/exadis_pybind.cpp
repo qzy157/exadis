@@ -815,6 +815,17 @@ CrossSlipBind make_cross_slip(std::string cross_slip_mode, Params& params, Force
     return CrossSlipBind(crossslip, params, cutoff);
 }
 
+CrossSlipBind make_cross_slip_fcc_thermal(Params& params, ForceBind& forcebind,
+                                          CrossSlipFCCThermal::Params fcc_params = CrossSlipFCCThermal::Params())
+{
+    System* system = make_system(new SerialDisNet(), Crystal(params.crystal), params);
+    Force* force = forcebind.force;
+    double cutoff = forcebind.neighbor_cutoff;
+    CrossSlip* crossslip = new CrossSlipFCCThermal(system, force, fcc_params);
+    exadis_delete(system);
+    return CrossSlipBind(crossslip, params, cutoff);
+}
+
 void handle_cross_slip(ExaDisNet& disnet, CrossSlipBind& crossslipbind)
 {
     System* system = disnet.adjust_system(crossslipbind.params);
@@ -1263,7 +1274,36 @@ PYBIND11_MODULE(pyexadis, m) {
     m.def("handle_cross_slip", &handle_cross_slip, "Wrapper to handle cross-slip operations",
           py::arg("net"), py::arg("cross_slip"));
 
-    
+    py::class_<CrossSlipFCCThermal::Params>(m, "CrossSlipFCCThermal_Params")
+        .def(py::init<>())
+        .def_readwrite("temperature",              &CrossSlipFCCThermal::Params::temperature)
+        .def_readwrite("evalFrequency",            &CrossSlipFCCThermal::Params::evalFrequency)
+        .def_readwrite("bulkActivationEnergy",     &CrossSlipFCCThermal::Params::bulkActivationEnergy)
+        .def_readwrite("bulkActivationVolume",     &CrossSlipFCCThermal::Params::bulkActivationVolume)
+        .def_readwrite("bulkAttemptFrequency",     &CrossSlipFCCThermal::Params::bulkAttemptFrequency)
+        .def_readwrite("bulkReferenceLength",      &CrossSlipFCCThermal::Params::bulkReferenceLength)
+        .def_readwrite("hirthActivationEnergy",    &CrossSlipFCCThermal::Params::hirthActivationEnergy)
+        .def_readwrite("hirthActivationVolume",    &CrossSlipFCCThermal::Params::hirthActivationVolume)
+        .def_readwrite("hirthAttemptFrequency",    &CrossSlipFCCThermal::Params::hirthAttemptFrequency)
+        .def_readwrite("hirthReferenceLength",     &CrossSlipFCCThermal::Params::hirthReferenceLength)
+        .def_readwrite("hirthEffectiveLength",     &CrossSlipFCCThermal::Params::hirthEffectiveLength)
+        .def_readwrite("glideLockActivationEnergy",&CrossSlipFCCThermal::Params::glideLockActivationEnergy)
+        .def_readwrite("glideLockActivationVolume",&CrossSlipFCCThermal::Params::glideLockActivationVolume)
+        .def_readwrite("glideLockAttemptFrequency",&CrossSlipFCCThermal::Params::glideLockAttemptFrequency)
+        .def_readwrite("glideLockReferenceLength", &CrossSlipFCCThermal::Params::glideLockReferenceLength)
+        .def_readwrite("glideLockEffectiveLength", &CrossSlipFCCThermal::Params::glideLockEffectiveLength)
+        .def_readwrite("lcLockActivationEnergy",   &CrossSlipFCCThermal::Params::lcLockActivationEnergy)
+        .def_readwrite("lcLockActivationVolume",   &CrossSlipFCCThermal::Params::lcLockActivationVolume)
+        .def_readwrite("lcLockAttemptFrequency",   &CrossSlipFCCThermal::Params::lcLockAttemptFrequency)
+        .def_readwrite("lcLockReferenceLength",    &CrossSlipFCCThermal::Params::lcLockReferenceLength)
+        .def_readwrite("lcLockEffectiveLength",    &CrossSlipFCCThermal::Params::lcLockEffectiveLength)
+        .def_readwrite("screwAngleTolerance",      &CrossSlipFCCThermal::Params::screwAngleTolerance);
+    m.def("make_cross_slip_fcc_thermal", &make_cross_slip_fcc_thermal,
+          "Instantiate thermally-activated FCC cross-slip",
+          py::arg("params"), py::arg("force"),
+          py::arg("fcc_params") = CrossSlipFCCThermal::Params());
+
+
     // Driver
     py::class_<ExaDiSApp>(m, "ExaDiSApp");
     py::class_<Driver, ExaDiSApp> driver(m, "Driver");
