@@ -19,8 +19,8 @@
  *-------------------------------------------------------------------------*/
 
 #pragma once
-#ifndef EXADIS_CROSS_SLIP_FCC_THERMAL_H
-#define EXADIS_CROSS_SLIP_FCC_THERMAL_H//头文件保护双保险，防止重复包含
+#ifndef EXADIS_CROSS_SLIP_FCC_WANSHENG_H
+#define EXADIS_CROSS_SLIP_FCC_WANSHENG_H//头文件保护双保险，防止重复包含
 
 #include <random>//引入 C++11 标准库的随机数生成头文件
 #include <cmath>//引入 C++11 标准库的数学函数头文件
@@ -32,11 +32,11 @@ namespace ExaDiS {
 
 /*---------------------------------------------------------------------------
  *
- *    Class:    CrossSlipFCCThermal
+ *    Class:    CrossSlipFCCWansheng
  *              Thermally-activated FCC cross-slip (serial implementation).
  *
  *-------------------------------------------------------------------------*/
-class CrossSlipFCCThermal : public CrossSlip {
+class CrossSlipFCCWansheng : public CrossSlip {
 public://继承自抽象基类 CrossSlip，意味着它必须实现基类的虚函数 handle() 和 name()
 
     /*-----------------------------------------------------------------------
@@ -78,6 +78,10 @@ public://继承自抽象基类 CrossSlip，意味着它必须实现基类的虚�
 
         /// Segment is considered screw if its angle with b is within this threshold [deg]
         double screwAngleTolerance = 15.0;//螺旋角容差，单位为度，表示如果一个段与 Burgers 向量的夹角在这个范围内，就被认为是螺旋段
+
+        /// 一条螺型子链允许的最少 segment 数（Hussein et al. p.4：最少 4 段，
+        /// 防止过短的链在 glide / cross-slip 面之间反复振荡）
+        int minChainSegments = 4;
 
         Params() = default;
     };
@@ -246,109 +250,123 @@ private:
             Vec3 plane_crystal = system->crystal.Rinv * plane0;//FCC 过滤。关键：先用 Rinv 把向量转到晶体系再判族，这是正确做法——但对照前面 get_crossslip_plane 用的是实验室系，这就是不一致的根源。
             if (!is_111_family(plane_crystal)) continue;//将参考滑移面法向 plane0 从实验室坐标系转换到晶体坐标系，得到 plane_crystal。然后检查它是否属于 FCC 晶体的 ⟨111⟩ 家族，即是否满足 {111} 的特征。如果不满足，说明这个链的滑移面不符合 FCC 位错的特征，直接跳过这个链，不将它纳入后续的螺旋链构建和分析中。
 
-            // Screw character check
-            int nfirst = snodes.front();//链上第一个节点的 id
-            int nlast  = snodes.back();//链上最后一个节点的 id
-            Vec3 pfirst = network->nodes[nfirst].pos;//获取链上第一个节点的位置信息，作为链的起点位置。后续会用它来计算链的方向向量。
-            Vec3 plast  = network->cell.pbc_position(pfirst,
-                                                     network->nodes[nlast].pos);//获取链上最后一个节点的位置信息，并考虑周期边界条件，得到 plast 作为链的终点位置。这样就得到了链的起点和终点位置，可以用它们来计算链的整体方向向量。
-            Vec3 chain_dir = plast - pfirst;//计算链的方向向量，即从起点指向终点的向量。后续会用这个向量来判断链的螺旋特征，即它与 Burgers 向量的夹角是否足够小。
-            double chain_len = chain_dir.norm();//计算链的长度，即方向向量的模长。后续会用这个长度来判断链是否足够长，以及在计算交滑移概率时作为链长参数。
-            if (chain_len < tol) continue;//如果链的长度小于容差，说明这个链过短，无法进行可靠的螺旋特征判断和交滑移分析，因此跳过这个链，不将它纳入后续的螺旋链构建和分析中。
-            chain_dir = chain_dir / chain_len;//将链的方向向量归一化，得到单位向量 chain_dir。后续会用这个单位向量来计算它与 Burgers 向量的夹角余弦值，以判断链的螺旋特征。 算链的整体方向（首到尾的弦向量）。pbc_position 把 nlast 的坐标在周期性边界下取离 pfirst 最近的镜像，避免跨边界时方向算错。
+            // === 螺型判定：把整条物理臂切成若干"极大连续螺型段"子链 ===
+            // 论文 Sec.2：检测"尽可能长的螺型链"(sequences of segments)；
+            // 论文 p.3：逐 segment 判 15°——某段与 b 夹角 <15° 即为螺型段。
+            // 修正1：15° 是 segment 的属性，链在"超 15° 的那一段"处断开，
+            //        断点落在最后一个螺型段与第一个非螺型段之间的结点上。
+            // 修正2：一条臂可产出多条子链，断开后跳过非螺型段、继续找下一段 run，
+            //        而不是接回同一条链（论文用复数 chains）。
+            Vec3 bhat = burg.normalized();
 
-            Vec3 bhat = burg.normalized();//将 Burgers 向量归一化，得到单位向量 bhat。后续会用这个单位向量来计算它与链的方向向量 chain_dir 的夹角余弦值，以判断链的螺旋特征。螺旋段的定义是：段的方向与 Burgers 向量的夹角小于某个容差（比如 15 度）。计算夹角余弦值：cos(theta) = dot(chain_dir, bhat)，如果 cos(theta) 接近 1 或 -1，说明夹角接近 0 或 180 度，段具有强烈的螺旋特征；如果 cos(theta) 接近 0，说明夹角接近 90 度，段不具有螺旋特征。
-            double screw_alignment = fabs(dot(chain_dir, bhat));//计算链的方向向量 chain_dir 与 Burgers 向量的单位向量 bhat 的点积，并取绝对值，得到 screw_alignment。这个值表示链的整体方向与 Burgers 向量的对齐程度，范围在 0 到 1 之间。screw_alignment 越接近 1，说明链越接近完全沿 Burgers 向量的方向，即具有强烈的螺旋特征；screw_alignment 越接近 0，说明链越垂直于 Burgers 向量，即不具有螺旋特征。后续会用这个值与螺旋角容差的余弦值进行比较，以判断链是否满足螺旋特征要求。
-
-            int non_screw_count = 0;//统计链上不具有螺旋特征的段的数量。后续会用这个数量与链上段的总数进行比较，以判断链是否满足整体的螺旋特征要求。具体来说，如果链上超过一半的段不具有螺旋特征，说明这个链整体上不具有足够的螺旋特征，也会被跳过。
+            // (a) 逐段标记是否为螺型段（segment 属性，而非整臂弦）
+            std::vector<char> is_screw(nseg, 0);
             for (int k = 0; k < nseg; k++) {
-                int nk  = snodes[k];
-                int nk1 = snodes[k+1];
-                Vec3 pk  = network->nodes[nk].pos;
-                Vec3 pk1 = network->cell.pbc_position(pk, network->nodes[nk1].pos);
-                Vec3 seg_dir = pk1 - pk;
-                double sl = seg_dir.norm();
-                if (sl < tol) continue;
-                if (fabs(dot(seg_dir / sl, bhat)) < scos) non_screw_count++;//对于链上每个段，计算它的方向向量 seg_dir，并归一化后与 Burgers 向量的单位向量 bhat 进行点积，得到这个段的对齐程度。如果这个值的绝对值小于螺旋角容差的余弦值 scos，说明这个段不具有足够的螺旋特征，统计到 non_screw_count 中。最后，如果 non_screw_count 超过链上段数的一半，说明这个链整体上不具有足够的螺旋特征，也会被跳过。
-            }
-            // ===== DEBUG: 螺型判定 (验证完删) =====  ← 插在这里
-            {
-                double chord_ang = acos(fmin(1.0, screw_alignment)) * 180.0 / M_PI;
-                bool rej = (screw_alignment < scos || non_screw_count > nseg / 2);
-                double amin = 1e9, amax = -1e9;
-                for (int kk = 0; kk < nseg; kk++) {
-                    Vec3 pa = network->nodes[snodes[kk]].pos;
-                    Vec3 pb = network->cell.pbc_position(pa, network->nodes[snodes[kk+1]].pos);
-                    Vec3 d  = pb - pa; double dl = d.norm();
-                    if (dl < tol) continue;
-                    double a = acos(fmin(1.0, fabs(dot(d/dl, bhat)))) * 180.0 / M_PI;
-                    amin = fmin(amin, a); amax = fmax(amax, a);
-                }
-                fprintf(stderr, "[OLD-CS] link=%d nseg=%d chord=%.1f  seg_ang=[%.1f,%.1f] "
-                                "non_screw=%d/%d -> %s\n",
-                        l, nseg, chord_ang, amin, amax, non_screw_count, nseg,
-                        rej ? "REJECT(whole arm)" : "keep");
-            }
-            // ===== DEBUG end =====
-            if (screw_alignment < scos || non_screw_count > nseg / 2) continue;//如果链的整体对齐程度 screw_alignment 小于螺旋角容差的余弦值 scos，说明链的整体方向与 Burgers 向量的夹角过大，不满足螺旋特征要求，直接跳过这个链，不将它纳入后续的螺旋链构建和分析中。或者，如果链上不具有螺旋特征的段的数量 non_screw_count 超过链上段数的一半，说明这个链整体上不具有足够的螺旋特征，也直接跳过这个链，不将它纳入后续的螺旋链构建和分析中。
-
-            // Classify mechanism type
-            MechanismType mechanism = Bulk;
-            if (network->conn[nfirst].num > 2 ||
-                network->conn[nlast].num  > 2) {
-                mechanism = Intersection;
-            }//根据链的端点节点的连接数来判断交滑移机制类型。如果链的第一个节点 nfirst 或最后一个节点 nlast 的连接数 num 大于 2，说明这个链的端点处存在位错交点，属于 Intersection 机制；否则，说明这个链完全位于体积内，没有交点，属于 Bulk 机制。 机制判定：conn[node].num 是该节点的连接度。普通位错节点连 2 段；>2 说明端点是位错结，归为 Intersection。
-
-            ScrewChain chain;//构建一个 ScrewChain 结构体实例，存储这个链的相关信息。包括链上节点 id 列表、段 id 列表、Burgers 向量、滑移面法向、交滑移机制类型等。后续会用这些信息来分析链的应力状态和计算交滑移概率。
-            chain.node_ids.assign(snodes.begin(), snodes.end());
-            chain.seg_ids.assign(ssegs.begin(), ssegs.end());
-            chain.burg        = burg;
-            chain.glide_plane = plane0;
-            chain.mechanism   = mechanism;//将链上节点 id 列表和段 id 列表分别赋值给 chain 的 node_ids 和 seg_ids。将之前计算的 Burgers 向量 burg 和参考滑移面法向 plane0 分别赋值给 chain 的 burg 和 glide_plane。将之前判断的交滑移机制类型 mechanism 赋值给 chain 的 mechanism 字段。
-
-            // For Intersection: identify junction arm and junction type
-            if (mechanism == Intersection) {
-                int jnode = (network->conn[nfirst].num > 2) ? nfirst : nlast;//对于 Intersection 机制的链，确定交点节点 jnode，即连接数大于 2 的那个端点节点。由于一个链的两个端点可能都连接数大于 2，这里优先选择 nfirst，如果 nfirst 的连接数大于 2 就选它，否则选 nlast。
-
-                Vec3 jburg(0.0);//初始化交点处的合 Burgers 向量 jburg。后续会通过累加连接到交点节点 jnode 的段的 Burgers 向量来计算 jburg。注意在累加时需要排除链上已经包含的段，以避免重复计算。
-                for (int k = 0; k < network->conn[jnode].num; k++) {
-                    int sk = network->conn[jnode].seg[k];
-                    bool in_chain = false;//检查这个段 sk 是否在当前链的段列表 ssegs 中。如果在，说明这个段已经被包含在链中，不应该再累加它的 Burgers 向量到 jburg 中；如果不在，说明这个段是连接到交点节点 jnode 的其他段，需要将它的 Burgers 向量根据连接顺序累加到 jburg 中。
-                    for (int sc : ssegs) if (sc == sk) { in_chain = true; break; }//遍历链上段的 id 列表 ssegs，检查是否存在与当前段 sk 相同的 id。如果找到相同的 id，说明 sk 在链上，将 in_chain 置为 true，并跳出循环。否则，in_chain 保持为 false。
-                    if (!in_chain) {
-                        int ord = network->conn[jnode].order[k];
-                        jburg = jburg + ord * network->segs[sk].burg;//如果 sk 不在链上，获取它在连接列表中的顺序 ord（可能是 +1 或 -1），根据 ord 的符号决定是否将 sk 的 Burgers 向量取反，然后累加到 jburg 中。这样就得到了交点处的合 Burgers 向量 jburg，它代表了交点处另一臂的 Burgers 向量。
-                    }
-                }
-                chain.junction_burg = jburg;//将计算得到的交点处的合 Burgers 向量 jburg 赋值给 chain 的 junction_burg 字段。 计算结另一侧所有"非本链"臂的合 Burgers 矢量。order[k] 是该 segment 相对该节点的方向符号（±1），保证 b 加和方向正确。这个合矢量决定结的类型。
-
-                for (int k = 0; k < network->conn[jnode].num; k++) {
-                    int sk = network->conn[jnode].seg[k];
-                    bool in_chain = false;//检查这个段 sk 是否在当前链的段列表 ssegs 中。如果在，说明这个段已经被包含在链中，不应该用它来判断结的滑移面；如果不在，说明这个段是连接到交点节点 jnode 的其他段，可以用它的滑移面来判断结的滑移面。由于一个交点可能连接多个段，这里只要找到一个不在链上的段，就可以用它的滑移面来判断结的滑移面。
-                    for (int sc : ssegs) if (sc == sk) { in_chain = true; break; }//遍历链上段的 id 列表 ssegs，检查是否存在与当前段 sk 相同的 id。如果找到相同的 id，说明 sk 在链上，将 in_chain 置为 true，并跳出循环。否则，in_chain 保持为 false。
-                    if (!in_chain) {
-                        chain.junction_plane = network->segs[sk].plane;
-                        break;//如果 sk 不在链上，获取它的滑移面法向量，并赋值给 chain 的 junction_plane 字段。然后跳出循环，因为只需要一个不在链上的段来判断结的滑移面。这个结的滑移面与结的 Burgers 向量一起决定了结的类型。
-                    }
-                }
-
-                Vec3 jburg_crystal = system->crystal.Rinv * jburg.normalized();
-                if (is_100_family(jburg_crystal)) {
-                    chain.junction = Hirth;//如果交点处的合 Burgers 向量 jburg 在晶体坐标系下属于 ⟨100⟩ 家族，说明这个结是 Hirth 锁。
-                } else if (is_110_family(jburg_crystal)) {
-                    Vec3 jplane_crystal = system->crystal.Rinv
-                                         * chain.junction_plane.normalized();
-                    if (is_111_family(jplane_crystal)) {
-                        chain.junction = GlideLock;//如果交点处的合 Burgers 向量 jburg 在晶体坐标系下属于 ⟨110⟩ 家族，并且结的滑移面在晶体坐标系下属于 {111} 家族，说明这个结是 Glide 锁。
-                    } else if (is_110_family(jplane_crystal) || is_100_family(jplane_crystal)) {
-                        chain.junction = LCLock;//如果交点处的合 Burgers 向量 jburg 在晶体坐标系下属于 ⟨110⟩ 家族，并且结的滑移面在晶体坐标系下属于 {110} 或 {100} 家族，说明这个结是 L-C 锁。
-                    }
-                } else {
-                    chain.junction = UnknownLock;//如果交点处的合 Burgers 向量 jburg 在晶体坐标系下既不属于 ⟨100⟩ 家族也不属于 ⟨110⟩ 家族，说明这个结的类型无法确定，标记为 UnknownLock。
-                }
+                Vec3 pa = network->nodes[snodes[k]].pos;
+                Vec3 pb = network->cell.pbc_position(pa, network->nodes[snodes[k+1]].pos);
+                Vec3 d  = pb - pa;
+                double dl = d.norm();
+                is_screw[k] = (dl > tol && fabs(dot(d / dl, bhat)) >= scos) ? 1 : 0;
             }
 
-            chains.push_back(std::move(chain));//将构建好的 chain 添加到 chains 向量中，准备返回给调用者。使用 std::move 来避免不必要的复制，提高效率。 
+            // (b) 提取极大连续螺型 run：每个区间 [kstart, kend) 各成一条子链
+            int kpos = 0;
+            while (kpos < nseg) {
+                if (!is_screw[kpos]) { kpos++; continue; }       // 非螺型段 -> 跳过
+                int kstart = kpos;
+                while (kpos < nseg && is_screw[kpos]) kpos++;     // 一直吃到非螺型为止
+                int kend = kpos;                                 // 螺型段区间 [kstart, kend)
+                int sub_nseg = kend - kstart;
+
+                // ===== DEBUG: 新螺型切分 (验证完删) =====
+                {
+                    double amin = 1e9, amax = -1e9;
+                    for (int kk = kstart; kk < kend; kk++) {
+                        Vec3 pa = network->nodes[snodes[kk]].pos;
+                        Vec3 pb = network->cell.pbc_position(pa, network->nodes[snodes[kk+1]].pos);
+                        Vec3 dd = pb - pa; double dl = dd.norm();
+                        if (dl < tol) continue;
+                        double a = acos(fmin(1.0, fabs(dot(dd/dl, bhat)))) * 180.0 / M_PI;
+                        amin = fmin(amin, a); amax = fmax(amax, a);
+                    }
+                    fprintf(stderr, "[WS-CS] link=%d run=[%d,%d) sub_nseg=%d seg_ang=[%.1f,%.1f] -> %s\n",
+                            l, kstart, kend, sub_nseg, amin, amax,
+                            (sub_nseg < params.minChainSegments) ? "drop(<min)" : "keep");
+                }
+                // ===== DEBUG end =====
+
+                if (sub_nseg < params.minChainSegments) continue;  // 论文 p.4：最少 4 段
+
+                // 子链的节点/段列表（节点数比段数多 1）
+                std::vector<int> sub_nodes(snodes.begin() + kstart,
+                                           snodes.begin() + kend + 1);
+                std::vector<int> sub_segs (ssegs.begin()  + kstart,
+                                           ssegs.begin()  + kend);
+
+                int nfirst = sub_nodes.front();
+                int nlast  = sub_nodes.back();
+
+                // 修正：机制判定用"子链"端点，而非整条臂端点。
+                // 臂中段的螺型 run 两端都是 2 连通内点 -> Bulk；
+                // 只有真正抵达结的 run 端点 conn>2 -> Intersection。
+                MechanismType mechanism = Bulk;
+                if (network->conn[nfirst].num > 2 ||
+                    network->conn[nlast].num  > 2) {
+                    mechanism = Intersection;
+                }
+
+                ScrewChain chain;
+                chain.node_ids    = sub_nodes;
+                chain.seg_ids     = sub_segs;
+                chain.burg        = burg;
+                chain.glide_plane = plane0;
+                chain.mechanism   = mechanism;
+
+                // Intersection：识别结臂与结类型。
+                // 注意 in_chain 判定用 sub_segs（本子链段表），不是整臂 ssegs。
+                if (mechanism == Intersection) {
+                    int jnode = (network->conn[nfirst].num > 2) ? nfirst : nlast;
+
+                    Vec3 jburg(0.0);
+                    for (int k = 0; k < network->conn[jnode].num; k++) {
+                        int sk = network->conn[jnode].seg[k];
+                        bool in_chain = false;
+                        for (int sc : sub_segs) if (sc == sk) { in_chain = true; break; }
+                        if (!in_chain) {
+                            int ord = network->conn[jnode].order[k];
+                            jburg = jburg + ord * network->segs[sk].burg;
+                        }
+                    }
+                    chain.junction_burg = jburg;
+
+                    for (int k = 0; k < network->conn[jnode].num; k++) {
+                        int sk = network->conn[jnode].seg[k];
+                        bool in_chain = false;
+                        for (int sc : sub_segs) if (sc == sk) { in_chain = true; break; }
+                        if (!in_chain) {
+                            chain.junction_plane = network->segs[sk].plane;
+                            break;
+                        }
+                    }
+
+                    Vec3 jburg_crystal = system->crystal.Rinv * jburg.normalized();
+                    if (is_100_family(jburg_crystal)) {
+                        chain.junction = Hirth;
+                    } else if (is_110_family(jburg_crystal)) {
+                        Vec3 jplane_crystal = system->crystal.Rinv
+                                             * chain.junction_plane.normalized();
+                        if (is_111_family(jplane_crystal)) {
+                            chain.junction = GlideLock;
+                        } else if (is_110_family(jplane_crystal) || is_100_family(jplane_crystal)) {
+                            chain.junction = LCLock;
+                        }
+                    } else {
+                        chain.junction = UnknownLock;
+                    }
+                }
+
+                chains.push_back(std::move(chain));
+            }
         }
         return chains;//返回构建好的所有满足条件的螺旋链列表 chains。每个链都包含了它的节点和段信息、Burgers 向量、滑移面法向、交滑移机制类型，以及如果是 Intersection 机制还包含了结的 Burgers 向量和滑移面等信息。这些信息将用于后续的应力计算和交滑移分析。 按合 Burgers 矢量的族 + 面的族把结分成 Hirth / Glide lock / LC lock。std::move 把 chain 的内部 vector 资源转移进容器，省一次深拷贝。
     }
@@ -563,20 +581,20 @@ private:
     }
 
 public:
-    CrossSlipFCCThermal() = default;
-    CrossSlipFCCThermal(System* /*system*/, Force* _force, Params _params)
+    CrossSlipFCCWansheng() = default;
+    CrossSlipFCCWansheng(System* /*system*/, Force* _force, Params _params)
         : force(_force), params(_params),
           rng(std::random_device{}()) {}//构造函数，接受系统指针、力对象指针和参数对象作为输入，并初始化成员变量。force 用于计算节点上的力，params 包含了交滑移分析和操作所需的各种参数，rng 是一个随机数生成器，用于在热激活机制中进行随机抽样。这个构造函数没有使用系统指针，但保留了这个参数以保持与其他处理器类的一致接口。
 
-    void handle(System* system) override//重写基类的 handle 函数，实现交滑移分析和操作的核心逻辑。首先进行 Kokkos fencing 来确保之前的计算完成，然后检查晶体类型和滑移面使用情况是否满足要求。接着根据评估频率决定是否进行交滑移分析，如果需要分析，则获取网络对象，构建螺链，并针对每个链根据其机制（Bulk 或 Intersection）调用相应的处理函数来执行交滑移分析和操作。最后再次进行 Kokkos fencing 来确保交滑移操作完成，并停止计时器。这个函数是整个 CrossSlipFCCThermal 类的核心，负责协调和执行交滑移相关的计算和操作。
+    void handle(System* system) override//重写基类的 handle 函数，实现交滑移分析和操作的核心逻辑。首先进行 Kokkos fencing 来确保之前的计算完成，然后检查晶体类型和滑移面使用情况是否满足要求。接着根据评估频率决定是否进行交滑移分析，如果需要分析，则获取网络对象，构建螺链，并针对每个链根据其机制（Bulk 或 Intersection）调用相应的处理函数来执行交滑移分析和操作。最后再次进行 Kokkos fencing 来确保交滑移操作完成，并停止计时器。这个函数是整个 CrossSlipFCCWansheng 类的核心，负责协调和执行交滑移相关的计算和操作。
     {
         Kokkos::fence();//在处理交滑移之前，调用 Kokkos::fence() 来确保之前的所有 Kokkos 计算都已经完成。这是为了保证在进行交滑移分析和操作时，所有相关的数据都是最新的，并且没有未完成的计算可能会影响结果。Kokkos::fence() 是 Kokkos 库提供的一个函数，用于同步设备上的计算，确保所有之前提交的计算都已经完成。
         system->timer[system->TIMER_CROSSSLIP].start();//启动交滑移处理的计时器，以便在性能分析中记录交滑移处理的时间。这个计时器会在整个 handle 函数执行期间运行，直到最后停止。通过这个计时器，可以评估交滑移处理的性能，并与其他处理器的性能进行比较。
 
         if (system->crystal.type != FCC_CRYSTAL)
-            ExaDiS_fatal("Error: CrossSlipFCCThermal requires FCC_CRYSTAL\n");//首先检查系统的晶体类型是否为 FCC_CRYSTAL。如果不是 FCC 晶体，说明这个交滑移处理器不适用于当前系统，直接报错并终止程序。这个检查是为了确保交滑移分析和操作的前提条件得到满足，因为这个处理器的算法是基于 FCC 晶体结构的特性设计的。
+            ExaDiS_fatal("Error: CrossSlipFCCWansheng requires FCC_CRYSTAL\n");//首先检查系统的晶体类型是否为 FCC_CRYSTAL。如果不是 FCC 晶体，说明这个交滑移处理器不适用于当前系统，直接报错并终止程序。这个检查是为了确保交滑移分析和操作的前提条件得到满足，因为这个处理器的算法是基于 FCC 晶体结构的特性设计的。
         if (!system->crystal.use_glide_planes)
-            ExaDiS_fatal("Error: CrossSlipFCCThermal requires use_glide_planes=true\n");//接着检查系统的晶体参数中是否启用了滑移面使用（use_glide_planes）。如果没有启用，说明这个交滑移处理器无法正确执行，因为它依赖于滑移面信息来进行分析和操作，直接报错并终止程序。这个检查是为了确保系统的配置满足交滑移处理器的要求。
+            ExaDiS_fatal("Error: CrossSlipFCCWansheng requires use_glide_planes=true\n");//接着检查系统的晶体参数中是否启用了滑移面使用（use_glide_planes）。如果没有启用，说明这个交滑移处理器无法正确执行，因为它依赖于滑移面信息来进行分析和操作，直接报错并终止程序。这个检查是为了确保系统的配置满足交滑移处理器的要求。
 
         eval_counter++;//增加评估计数器 eval_counter 的值，用于跟踪已经执行了多少次交滑移评估。这个计数器在每次调用 handle 函数时都会增加，主要用于根据系统参数中的 evalFrequency 来决定是否进行交滑移分析。如果 evalFrequency 大于 1，则只有当 eval_counter 达到 evalFrequency 的倍数时才会进行交滑移分析，否则直接返回。这种机制可以用来控制交滑移分析的频率，减少计算开销。
         if (params.evalFrequency > 1 &&
@@ -600,34 +618,34 @@ public:
         system->timer[system->TIMER_CROSSSLIP].stop();//在完成所有链的交滑移处理后，再次调用 Kokkos::fence() 来确保所有的交滑移操作都已经完成，然后停止计时器。这样就完整地记录了整个交滑移处理的时间，并确保在性能分析中得到准确的结果。
     }
 
-    const char* name() override { return "CrossSlipFCCThermal"; }
+    const char* name() override { return "CrossSlipFCCWansheng"; }
 };
 
 
 /*---------------------------------------------------------------------------
  *
- *    Class:    CrossSlipFCCThermalParallel<F>
- *              Kokkos-aware wrapper for CrossSlipFCCThermal.
+ *    Class:    CrossSlipFCCWanshengParallel<F>
+ *              Kokkos-aware wrapper for CrossSlipFCCWansheng.
  *              Adds Kokkos fencing around the serial algorithm for GPU builds.
  *
  *-------------------------------------------------------------------------*/
-template<class F>//定义一个模板类 CrossSlipFCCThermalParallel，继承自 CrossSlipFCCThermal。这个类是一个 Kokkos-aware 的包装器，用于在 GPU 构建中添加 Kokkos fencing 来确保计算的正确性。通过在 handle 函数中添加 Kokkos fencing，可以确保在执行交滑移分析和操作时，所有相关的计算都已经完成，从而避免数据竞争和不一致的问题。这个类的实现非常简单，主要是在 handle 函数的开始和结束处添加 Kokkos fencing，然后调用基类的 handle 函数来执行实际的交滑移处理逻辑。
-class CrossSlipFCCThermalParallel : public CrossSlipFCCThermal {
+template<class F>//定义一个模板类 CrossSlipFCCWanshengParallel，继承自 CrossSlipFCCWansheng。这个类是一个 Kokkos-aware 的包装器，用于在 GPU 构建中添加 Kokkos fencing 来确保计算的正确性。通过在 handle 函数中添加 Kokkos fencing，可以确保在执行交滑移分析和操作时，所有相关的计算都已经完成，从而避免数据竞争和不一致的问题。这个类的实现非常简单，主要是在 handle 函数的开始和结束处添加 Kokkos fencing，然后调用基类的 handle 函数来执行实际的交滑移处理逻辑。
+class CrossSlipFCCWanshengParallel : public CrossSlipFCCWansheng {
 public:
-    CrossSlipFCCThermalParallel(System* system, Force* _force,
-                                CrossSlipFCCThermal::Params _params)
-        : CrossSlipFCCThermal(system, _force, _params) {}//构造函数，接受系统指针、力对象指针和参数对象作为输入，并调用基类的构造函数来初始化成员变量。这个构造函数没有添加额外的逻辑，只是简单地将参数传递给基类的构造函数。
+    CrossSlipFCCWanshengParallel(System* system, Force* _force,
+                                CrossSlipFCCWansheng::Params _params)
+        : CrossSlipFCCWansheng(system, _force, _params) {}//构造函数，接受系统指针、力对象指针和参数对象作为输入，并调用基类的构造函数来初始化成员变量。这个构造函数没有添加额外的逻辑，只是简单地将参数传递给基类的构造函数。
 
     void handle(System* system) override//重写基类的 handle 函数，在函数开始和结束处添加 Kokkos fencing 来确保计算的正确性。首先调用 Kokkos::fence() 来确保之前的计算完成，然后调用基类的 handle 函数来执行实际的交滑移处理逻辑，最后再次调用 Kokkos::fence() 来确保交滑移操作完成。通过这种方式，可以在 GPU 构建中确保数据的一致性和正确性，避免由于并行计算引起的数据竞争和不一致问题。
     {
         Kokkos::fence();
-        CrossSlipFCCThermal::handle(system);
+        CrossSlipFCCWansheng::handle(system);
         Kokkos::fence();
     }//在 handle 函数的开始和结束处添加 Kokkos fencing 来确保计算的正确性。通过调用 Kokkos::fence()，可以确保在执行交滑移分析和操作时，所有相关的计算都已经完成，从而避免数据竞争和不一致的问题。这个函数主要是为了在 GPU 构建中使用 Kokkos fencing 来保护基类的 handle 函数的执行。
 
-    const char* name() override { return "CrossSlipFCCThermalParallel"; }//重写 name 函数，返回类的名称 "CrossSlipFCCThermalParallel"。这个函数可以用于在日志或性能分析中标识当前使用的交滑移处理器的类型。通过返回不同的名称，可以区分使用了 Kokkos fencing 的并行版本和没有 fencing 的串行版本，从而在性能分析中更清晰地了解不同处理器的表现。
-};//重写 name 函数，返回类的名称 "CrossSlipFCCThermalParallel"。这个函数可以用于在日志或性能分析中标识当前使用的交滑移处理器的类型。
+    const char* name() override { return "CrossSlipFCCWanshengParallel"; }//重写 name 函数，返回类的名称 "CrossSlipFCCWanshengParallel"。这个函数可以用于在日志或性能分析中标识当前使用的交滑移处理器的类型。通过返回不同的名称，可以区分使用了 Kokkos fencing 的并行版本和没有 fencing 的串行版本，从而在性能分析中更清晰地了解不同处理器的表现。
+};//重写 name 函数，返回类的名称 "CrossSlipFCCWanshengParallel"。这个函数可以用于在日志或性能分析中标识当前使用的交滑移处理器的类型。
 
 } // namespace ExaDiS
 
-#endif // EXADIS_CROSS_SLIP_FCC_THERMAL_H
+#endif // EXADIS_CROSS_SLIP_FCC_WANSHENG_H

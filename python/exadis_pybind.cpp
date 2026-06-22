@@ -826,6 +826,17 @@ CrossSlipBind make_cross_slip_fcc_thermal(Params& params, ForceBind& forcebind,
     return CrossSlipBind(crossslip, params, cutoff);
 }
 
+CrossSlipBind make_cross_slip_fcc_test(Params& params, ForceBind& forcebind,
+                                       CrossSlipFCCTest::Params fcc_params = CrossSlipFCCTest::Params())
+{
+    System* system = make_system(new SerialDisNet(), Crystal(params.crystal), params);
+    Force* force = forcebind.force;
+    double cutoff = forcebind.neighbor_cutoff;
+    CrossSlip* crossslip = new CrossSlipFCCTest(system, force, fcc_params);
+    exadis_delete(system);
+    return CrossSlipBind(crossslip, params, cutoff);
+}
+
 void handle_cross_slip(ExaDisNet& disnet, CrossSlipBind& crossslipbind)
 {
     System* system = disnet.adjust_system(crossslipbind.params);
@@ -1302,6 +1313,36 @@ PYBIND11_MODULE(pyexadis, m) {
           "Instantiate thermally-activated FCC cross-slip",
           py::arg("params"), py::arg("force"),
           py::arg("fcc_params") = CrossSlipFCCThermal::Params());
+
+    py::class_<CrossSlipFCCTest::Params>(m, "CrossSlipFCCTest_Params")
+        .def(py::init<>())
+        .def_readwrite("temperature",              &CrossSlipFCCTest::Params::temperature)
+        .def_readwrite("evalFrequency",            &CrossSlipFCCTest::Params::evalFrequency)
+        .def_readwrite("bulkActivationEnergy",     &CrossSlipFCCTest::Params::bulkActivationEnergy)
+        .def_readwrite("bulkActivationVolume",     &CrossSlipFCCTest::Params::bulkActivationVolume)
+        .def_readwrite("bulkAttemptFrequency",     &CrossSlipFCCTest::Params::bulkAttemptFrequency)
+        .def_readwrite("bulkReferenceLength",      &CrossSlipFCCTest::Params::bulkReferenceLength)
+        .def_readwrite("hirthActivationEnergy",    &CrossSlipFCCTest::Params::hirthActivationEnergy)
+        .def_readwrite("hirthActivationVolume",    &CrossSlipFCCTest::Params::hirthActivationVolume)
+        .def_readwrite("hirthAttemptFrequency",    &CrossSlipFCCTest::Params::hirthAttemptFrequency)
+        .def_readwrite("hirthReferenceLength",     &CrossSlipFCCTest::Params::hirthReferenceLength)
+        .def_readwrite("hirthEffectiveLength",     &CrossSlipFCCTest::Params::hirthEffectiveLength)
+        .def_readwrite("glideLockActivationEnergy",&CrossSlipFCCTest::Params::glideLockActivationEnergy)
+        .def_readwrite("glideLockActivationVolume",&CrossSlipFCCTest::Params::glideLockActivationVolume)
+        .def_readwrite("glideLockAttemptFrequency",&CrossSlipFCCTest::Params::glideLockAttemptFrequency)
+        .def_readwrite("glideLockReferenceLength", &CrossSlipFCCTest::Params::glideLockReferenceLength)
+        .def_readwrite("glideLockEffectiveLength", &CrossSlipFCCTest::Params::glideLockEffectiveLength)
+        .def_readwrite("lcLockActivationEnergy",   &CrossSlipFCCTest::Params::lcLockActivationEnergy)
+        .def_readwrite("lcLockActivationVolume",   &CrossSlipFCCTest::Params::lcLockActivationVolume)
+        .def_readwrite("lcLockAttemptFrequency",   &CrossSlipFCCTest::Params::lcLockAttemptFrequency)
+        .def_readwrite("lcLockReferenceLength",    &CrossSlipFCCTest::Params::lcLockReferenceLength)
+        .def_readwrite("lcLockEffectiveLength",    &CrossSlipFCCTest::Params::lcLockEffectiveLength)
+        .def_readwrite("screwAngleTolerance",      &CrossSlipFCCTest::Params::screwAngleTolerance)
+        .def_readwrite("minRunLength",             &CrossSlipFCCTest::Params::minRunLength);
+    m.def("make_cross_slip_fcc_test", &make_cross_slip_fcc_test,
+          "Instantiate run-based thermally-activated FCC cross-slip (test)",
+          py::arg("params"), py::arg("force"),
+          py::arg("fcc_params") = CrossSlipFCCTest::Params());
 
 
     // Driver

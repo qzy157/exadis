@@ -15,6 +15,11 @@
  *  Thermal probability:
  *    P = nu * dt * (L / L_ref) * exp(-(E_a - V_a * dSigma_Escaig) / (kB * T))
  *
+ *  test_3: dimensional fix relative to test_2. The Schmid stress in
+ *  compute_chain_stresses is now divided by (L * burgmag), so it is a TRUE
+ *  resolved shear stress consistent with the Escaig stress and the mu*b/(10L)
+ *  threshold. All other logic (orientation-independent cross-slip plane,
+ *  per-run chain extraction, anchor pinning) is identical to test_2.
  *
  *-------------------------------------------------------------------------*/
 
@@ -79,6 +84,9 @@ public://继承自抽象基类 CrossSlip，意味着它必须实现基类的虚�
         /// Segment is considered screw if its angle with b is within this threshold [deg]
         double screwAngleTolerance = 15.0;//螺旋角容差，单位为度，表示如果一个段与 Burgers 向量的夹角在这个范围内，就被认为是螺旋段
 
+        /// Minimum screw-run length [b] to be eligible for cross-slip (0 = no minimum)
+        double minRunLength = 0.0;//螺型 run 最小长度（单位 b），太短不参与交滑移；0=不设下限
+
         Params() = default;
     };
 
@@ -107,6 +115,8 @@ private:
         LockType  junction  = UnknownLock;//交点锁类型，默认为未知锁
         Vec3 junction_burg;//结另一臂的合 Burgers 矢量
         Vec3 junction_plane;//结另一臂的面
+        bool start_anchor = false;  // 起点锚节点：钉住不动（连到 run 之外的段）
+        bool end_anchor   = false;  // 终点锚节点
     };
 
     // -----------------------------------------------------------------------
@@ -155,20 +165,32 @@ private:
     }//⟨112⟩ 判据：一个分量最大（如 2），另两个分量约等于最大值的一半（如 1），且都非零（如 [2,1,1]）。先找出最大值，再统计有多少分量接近最大值，多少分量接近最大值的一半，最后检查是否满足 1 个接近最大值，2 个接近一半的条件。
 
     // -----------------------------------------------------------------------
-    //  Returns the cross-slip plane normal for an FCC 1/2<110> dislocation.
-    //  Given glide plane n and Burgers vector b, returns the other {111} plane
-    //  containing b by flipping the sign of the zero component of b in n.
+    //  Returns the cross-slip {111} plane normal (LAB frame) for an FCC
+    //  1/2<110> dislocation -- ORIENTATION INDEPENDENT.
+    //  The "flip the zero component of b" trick is only valid where b is
+    //  axis-aligned, i.e. in the CRYSTAL frame. So we rotate b and the glide
+    //  normal into the crystal frame with Rinv, build the other {111} there,
+    //  then rotate the result back to the lab frame with R. (R = I reproduces
+    //  the original behaviour.)
+    //  方向无关版：先用 Rinv 转到晶体系（b 在那里才是轴对齐 1/2<110>），翻号得到
+    //  另一张 {111}，再用 R 转回实验室系。晶体旋转 R!=I 时也正确，不再静默返回零向量。
     // -----------------------------------------------------------------------
     static Vec3 get_crossslip_plane(const Vec3& glide_plane_normal,
-                                    const Vec3& burg) {
+                                    const Vec3& burg,
+                                    const Mat33& R, const Mat33& Rinv) {
         const double tol = 1e-6;
-        Vec3 bn = burg.normalized();
-        if (fabs(dot(bn, glide_plane_normal)) > tol) return Vec3(0.0);//如果 Burgers 向量与滑移面法向的点积不接近零，说明它们不垂直，返回零向量表示无法确定交滑移面
-        if (fabs(bn.x) < tol) return Vec3(-glide_plane_normal.x,  glide_plane_normal.y,  glide_plane_normal.z);
-        if (fabs(bn.y) < tol) return Vec3( glide_plane_normal.x, -glide_plane_normal.y,  glide_plane_normal.z);
-        if (fabs(bn.z) < tol) return Vec3( glide_plane_normal.x,  glide_plane_normal.y, -glide_plane_normal.z);
-        return Vec3(0.0);//如果 Burgers 向量的三个分量都不接近零，说明它不符合 1/2<110> 的特征，无法确定交滑移面，返回零向量。
-    }//对 1/2⟨110⟩ 位错，含 b 的 {111} 面有两张，当前面是 glide，另一张就是 cross-slip 面。算法：b 哪个分量为零，就把法向那个分量翻号。例如 b=[1,-1,0]（z 分量为零），glide=(1,1,1)，翻 z 得 (1,1,-1)，正好是另一张含 b 的 {111}。注意我上轮提的隐患就在这里——它要求 b 是轴对齐的，即只在晶体坐标系成立，而传进来的是实验室系向量。
+        Vec3 bn = (Rinv * burg).normalized();        // b in crystal frame (axis-aligned)
+        Vec3 n  = Rinv * glide_plane_normal;         // glide normal in crystal frame
+        if (fabs(dot(bn, n.normalized())) > tol) return Vec3(0.0);  // b must lie in the plane
+        // Flip the n-component where b is (near) zero -- the <110> "zero" axis,
+        // chosen as the smallest |component| so it is robust to numerical noise in R.
+        double ax = fabs(bn.x), ay = fabs(bn.y), az = fabs(bn.z);
+        Vec3 cs;
+        if      (ax <= ay && ax <= az) cs = Vec3(-n.x,  n.y,  n.z);
+        else if (ay <= ax && ay <= az) cs = Vec3( n.x, -n.y,  n.z);
+        else                           cs = Vec3( n.x,  n.y, -n.z);
+        return R * cs;                               // back to lab frame
+    }
 
     // -----------------------------------------------------------------------
     //  Escaig stress component from accumulated chain force.
@@ -183,7 +205,7 @@ private:
         double len = escaig_dir.norm();
         if (len < 1e-10) return 0.0;
         return dot(force, escaig_dir / len) / (burg_mag * total_length);
-    }//Escaig 应力的计算：首先计算 Escaig 方向（垂直于 Burgers 向量和面法向的叉积），然后将链上累积的力投影到 Escaig 方向上，并除以 Burgers 模长和链长，得到平均 Escaig 应力。注意这里也有隐患：如果 Burgers 向量和面法向几乎平行，Escaig 方向的模长会很小，可能导致数值不稳定。 Escaig 应力作用在刃分量上、驱动分位错间距变化。cross(n,b) 给出面内垂直于 b 的方向（刃方向），把合力投影到该单位方向，再除以 b·L 归一成应力。这里除了 burg_mag，而后面 Schmid 没除——就是我上轮说的量纲不一致点。
+    }//Escaig 应力的计算：首先计算 Escaig 方向（垂直于 Burgers 向量和面法向的叉积），然后将链上累积的力投影到 Escaig 方向上，并除以 Burgers 模长和链长，得到平均 Escaig 应力。注意这里也有隐患：如果 Burgers 向量和面法向几乎平行，Escaig 方向的模长会很小，可能导致数值不稳定。 Escaig 应力作用在刃分量上、驱动分位错间距变化。cross(n,b) 给出面内垂直于 b 的方向（刃方向），把合力投影到该单位方向，再除以 b·L 归一成真实应力。test_3 中 Schmid 也已改为除以 b·L，两者量纲一致。
 
     // -----------------------------------------------------------------------
     //  Arrhenius cross-slip probability per time step (Hussein et al. Eq. 2):
@@ -199,165 +221,174 @@ private:
     }//根据 Arrhenius 公式计算热激活的交滑移概率。输入参数包括激活能 E_a、激活体积 V_a、Esclaig 应力差 dSigma_E、温度、尝试频率、时间步长、链长和参考长度。输出是一个概率值，表示在给定条件下发生交滑移的概率。 就是注释那条 Arrhenius 公式。V_a*dSigma_E 是应力对势垒的降低量，dSigma_E>0 时指数变大、概率升高。前面乘 ν·dt·(L/L_ref)：长链有更多成核位点、概率正比于长度。
 
     // -----------------------------------------------------------------------
-    //  Builds all screw chain candidates from physical dislocation links.
-    //  Applies FCC crystallographic filters and the screw angle criterion.
+    //  classify_run: mechanism / anchor / junction classification for one run.
+    //  A run boundary node is an ANCHOR (pinned in execute_crossslip) whenever
+    //  it carries a segment outside this run (conn.num > 1):
+    //    - junction node (conn>2)        -> anchor + Intersection
+    //    - interior bend (conn==2)       -> anchor (shared with non-screw arm)
+    //    - free dislocation end (conn==1)-> not an anchor (free to move)
+    //  边界节点只要还连着 run 之外的段(conn>1)就钉住；结端(conn>2)同时定为 Intersection。
+    // -----------------------------------------------------------------------
+    void classify_run(System* system, SerialDisNet* network, ScrewChain& chain)
+    {
+        int nstart = chain.node_ids.front();
+        int nend   = chain.node_ids.back();
+        int cs = network->conn[nstart].num;
+        int ce = network->conn[nend].num;
+
+        chain.start_anchor = (cs > 1);
+        chain.end_anchor   = (ce > 1);
+
+        bool js = (cs > 2), je = (ce > 2);
+        chain.mechanism = (js || je) ? Intersection : Bulk;
+        chain.junction  = UnknownLock;
+        if (!js && !je) return;                 // pure Bulk run: no junction info needed
+
+        int jnode = js ? nstart : nend;         // 若两端都是结，优先按起点结分类（同原实现局限）
+
+        // 合 Burgers 矢量 = 结上所有"非本 run"臂的 order 符号加和
+        Vec3 jburg(0.0);
+        for (int a = 0; a < network->conn[jnode].num; a++) {
+            int sk = network->conn[jnode].seg[a];
+            bool in_run = false;
+            for (int sc : chain.seg_ids) if (sc == sk) { in_run = true; break; }
+            if (!in_run) {
+                int ord = network->conn[jnode].order[a];
+                jburg = jburg + ord * network->segs[sk].burg;
+            }
+        }
+        chain.junction_burg = jburg;
+
+        // 结另一臂的滑移面（取第一条非本 run 的臂）
+        for (int a = 0; a < network->conn[jnode].num; a++) {
+            int sk = network->conn[jnode].seg[a];
+            bool in_run = false;
+            for (int sc : chain.seg_ids) if (sc == sk) { in_run = true; break; }
+            if (!in_run) { chain.junction_plane = network->segs[sk].plane; break; }
+        }
+
+        Vec3 jburg_crystal = system->crystal.Rinv * jburg.normalized();
+        if (is_100_family(jburg_crystal)) {
+            chain.junction = Hirth;
+        } else if (is_110_family(jburg_crystal)) {
+            Vec3 jplane_crystal = system->crystal.Rinv * chain.junction_plane.normalized();
+            if (is_111_family(jplane_crystal))
+                chain.junction = GlideLock;
+            else if (is_110_family(jplane_crystal) || is_100_family(jplane_crystal))
+                chain.junction = LCLock;
+        } else {
+            chain.junction = UnknownLock;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    //  Builds screw-RUN chain candidates from physical dislocation links.
+    //  A physical link (junction-to-junction arm) is NOT taken as one chain.
+    //  It is scanned and split into MAXIMAL contiguous runs of segments that are
+    //  (a) screw within screwAngleTolerance, (b) coplanar, (c) same line sense.
+    //  Each run becomes one ScrewChain, so a locally-screw sub-segment is no
+    //  longer masked by the global (end-to-end) character of a bent arm.
+    //  不再把整条臂当一条链：沿臂切出"最长连续螺型同面同向子段(run)"，每个 run 单独成链。
     // -----------------------------------------------------------------------
     std::vector<ScrewChain> build_screw_chains(System* system,
                                                SerialDisNet* network)
     {
         const double tol  = 1e-6;
-        const double scos = cos(params.screwAngleTolerance * M_PI / 180.0);//螺旋角容差的余弦值，用于判断段是否具有足够的螺旋特征。比如 15 度对应 cos(15°) ≈ 0.9659，意味着段与 Burgers 向量的夹角必须小于 15 度才能被认为是螺旋段。
+        const double scos = cos(params.screwAngleTolerance * M_PI / 180.0);
 
-        SerialDisNet::DisLinks dislinks = network->physical_links();//获取物理位错链信息，包括链上节点和段的 id 列表。每条链至少包含一个段和两个节点。 取所有"物理链"（两结点之间的一串segment）
-        std::vector<ScrewChain> chains;//存储满足条件的螺旋链
+        SerialDisNet::DisLinks dislinks = network->physical_links();
+        std::vector<ScrewChain> chains;
 
         for (int l = 0; l < dislinks.number_of_links; l++) {
-            const auto& snodes = dislinks.links_nodes[l];//链上节点 id 列表
-            const auto& ssegs  = dislinks.links_segs[l];//链上段 id 列表
+            const auto& snodes = dislinks.links_nodes[l];
+            const auto& ssegs  = dislinks.links_segs[l];
             if (ssegs.empty()) continue;
-            int nseg = (int)ssegs.size();//链上段的数量 遍历每条物理链。对于每条链，首先检查是否为空链（没有段），如果是则跳过。然后获取链上节点和段的 id 列表，并计算段的数量 nseg。
+            int nseg = (int)ssegs.size();
 
-            // Burgers vector, sign-corrected for traversal direction
-            int s0 = ssegs[0];//链上第一个段的 id，根据这个段的 Burgers 向量来确定整个链的 Burgers 向量。由于链上段的方向可能不一致，需要根据第一个段的节点顺序来修正 Burgers 向量的符号。具体来说，取第一个段 s0 的两个节点 id，判断哪个节点在前（snodes[0]）哪个在后（snodes[1]），如果 s0 的 n2 是 snodes[0]，说明第一个段的方向与节点列表的顺序相反，需要将 Burgers 向量取反。
-            int n0 = snodes[0];//链上第一个节点的 id
-            Vec3 burg = network->segs[s0].burg;//获取第一个段的 Burgers 向量
-            if (network->segs[s0].n2 == n0) burg = -burg;//如果第一个段的第二个节点是链上第一个节点，说明段的方向与节点列表的顺序相反，需要将 Burgers 向量取反。这样就确保了整个链的 Burgers 向量与节点列表的顺序一致。 取第一个 segment 的 Burgers 矢量。位错 segment 有方向（n1→n2），若遍历起点 n0 恰好是 segment 的终点 n2，说明方向相反，b 取负，保证沿链方向一致。
+            // --- link-wide Burgers vector (sign-corrected for traversal) ---
+            int s0 = ssegs[0];
+            int n0 = snodes[0];
+            Vec3 burg = network->segs[s0].burg;
+            if (network->segs[s0].n2 == n0) burg = -burg;
 
-            // Reject links with inconsistent glide planes
-            Vec3 plane0 = network->segs[s0].plane;//获取第一个段的滑移面法向量，作为整个链的参考滑移面。后续会检查链上其他段的滑移面是否与这个参考面一致。
-            if (plane0.norm() < tol) continue;//如果第一个段的滑移面法向量的模长小于容差，说明这个段没有有效的滑移面信息，无法用来判断链的滑移面一致性，因此跳过这个链。否则，将这个参考滑移面归一化，后续会用它来检查链上其他段的滑移面是否一致。
-            plane0 = plane0.normalized();//将第一个段的滑移面法向量归一化，得到单位向量 plane0 作为整个链的参考滑移面。后续会检查链上其他段的滑移面是否与这个参考面一致。对于 FCC 位错，所有段应该共享同一 {111} 面，因此它们的法向量应该相同或相反（即 plane0 或 -plane0）。
+            // FCC filter on b (link-wide). Plane is checked PER RUN below.
+            Vec3 burg_crystal = system->crystal.Rinv * burg.normalized();
+            if (!is_110_family(burg_crystal)) continue;
+            Vec3 bhat = burg.normalized();
 
-            bool consistent_plane = true;//标志位，表示链上所有段的滑移面是否与参考面一致。初始值为 true，后续会检查链上每个段的滑移面，如果发现不一致的情况（既不接近 plane0 也不接近 -plane0），就将这个标志置为 false，并跳出循环。
-            for (int k = 0; k < nseg; k++) {
-                int sk = ssegs[k];
-                Vec3 p = network->segs[sk].plane;
-                if (p.norm() < tol) { consistent_plane = false; break; }
-                p = p.normalized();
-                if ((p - plane0).norm() > tol && (p + plane0).norm() > tol) {
-                    consistent_plane = false; break;
-                }//对于链上每个段，获取它的滑移面法向量 p，并检查它是否与参考面 plane0 一致。具体来说，首先检查 p 的模长是否有效，如果小于容差，说明这个段没有有效的滑移面信息，直接标记为不一致并跳出循环。否则，将 p 归一化后，检查它与 plane0 的差和与 -plane0 的差是否都小于容差。如果两者都不接近，说明这个段的滑移面与参考面不一致，也标记为不一致并跳出循环。只有当链上所有段的滑移面都接近 plane0 或 -plane0 时，consistent_plane 才保持为 true，表示这个链满足 FCC 位错的滑移面一致性要求。
-            }
-            if (!consistent_plane) continue;//如果链上存在滑移面不一致的段，说明这个链不满足 FCC 位错的特征，直接跳过这个链，不将它纳入后续的螺旋链构建和分析中。
+            // PBC-aware unit direction of link segment k (len returned via len_out)
+            auto seg_unit = [&](int k, double& len_out) -> Vec3 {
+                Vec3 pk  = network->nodes[snodes[k]].pos;
+                Vec3 pk1 = network->cell.pbc_position(pk, network->nodes[snodes[k+1]].pos);
+                Vec3 d = pk1 - pk;
+                len_out = d.norm();
+                return (len_out > tol) ? d / len_out : Vec3(0.0);
+            };
 
-            // FCC filter: Burgers must be 1/2<110>, plane must be {111}
-            Vec3 burg_crystal  = system->crystal.Rinv * burg.normalized();
-            if (!is_110_family(burg_crystal)) continue;//将 Burgers 向量从实验室坐标系转换到晶体坐标系，得到 burg_crystal。然后检查它是否属于 FCC 晶体的 ⟨110⟩ 家族，即是否满足 1/2<110> 的特征。如果不满足，说明这个链的 Burgers 向量不符合 FCC 位错的特征，直接跳过这个链，不将它纳入后续的螺旋链构建和分析中。
-            Vec3 plane_crystal = system->crystal.Rinv * plane0;//FCC 过滤。关键：先用 Rinv 把向量转到晶体系再判族，这是正确做法——但对照前面 get_crossslip_plane 用的是实验室系，这就是不一致的根源。
-            if (!is_111_family(plane_crystal)) continue;//将参考滑移面法向 plane0 从实验室坐标系转换到晶体坐标系，得到 plane_crystal。然后检查它是否属于 FCC 晶体的 ⟨111⟩ 家族，即是否满足 {111} 的特征。如果不满足，说明这个链的滑移面不符合 FCC 位错的特征，直接跳过这个链，不将它纳入后续的螺旋链构建和分析中。
+            // --- scan the link, extracting maximal screw runs ---
+            int k = 0;
+            while (k < nseg) {
+                double sl;
+                Vec3 dir = seg_unit(k, sl);
+                Vec3 plane_k = network->segs[ssegs[k]].plane;
+                bool screw_k = (sl > tol) && (fabs(dot(dir, bhat)) >= scos);
+                if (!screw_k || plane_k.norm() < tol) { k++; continue; }
 
-            // Screw character check
-            int nfirst = snodes.front();//链上第一个节点的 id
-            int nlast  = snodes.back();//链上最后一个节点的 id
-            Vec3 pfirst = network->nodes[nfirst].pos;//获取链上第一个节点的位置信息，作为链的起点位置。后续会用它来计算链的方向向量。
-            Vec3 plast  = network->cell.pbc_position(pfirst,
-                                                     network->nodes[nlast].pos);//获取链上最后一个节点的位置信息，并考虑周期边界条件，得到 plast 作为链的终点位置。这样就得到了链的起点和终点位置，可以用它们来计算链的整体方向向量。
-            Vec3 chain_dir = plast - pfirst;//计算链的方向向量，即从起点指向终点的向量。后续会用这个向量来判断链的螺旋特征，即它与 Burgers 向量的夹角是否足够小。
-            double chain_len = chain_dir.norm();//计算链的长度，即方向向量的模长。后续会用这个长度来判断链是否足够长，以及在计算交滑移概率时作为链长参数。
-            if (chain_len < tol) continue;//如果链的长度小于容差，说明这个链过短，无法进行可靠的螺旋特征判断和交滑移分析，因此跳过这个链，不将它纳入后续的螺旋链构建和分析中。
-            chain_dir = chain_dir / chain_len;//将链的方向向量归一化，得到单位向量 chain_dir。后续会用这个单位向量来计算它与 Burgers 向量的夹角余弦值，以判断链的螺旋特征。 算链的整体方向（首到尾的弦向量）。pbc_position 把 nlast 的坐标在周期性边界下取离 pfirst 最近的镜像，避免跨边界时方向算错。
+                // open a run at segment k
+                int rstart = k;
+                int rend   = k;                       // inclusive last segment of run
+                Vec3 run_plane = plane_k.normalized();
+                double run_sense = (dot(dir, bhat) >= 0.0) ? 1.0 : -1.0;
 
-            Vec3 bhat = burg.normalized();//将 Burgers 向量归一化，得到单位向量 bhat。后续会用这个单位向量来计算它与链的方向向量 chain_dir 的夹角余弦值，以判断链的螺旋特征。螺旋段的定义是：段的方向与 Burgers 向量的夹角小于某个容差（比如 15 度）。计算夹角余弦值：cos(theta) = dot(chain_dir, bhat)，如果 cos(theta) 接近 1 或 -1，说明夹角接近 0 或 180 度，段具有强烈的螺旋特征；如果 cos(theta) 接近 0，说明夹角接近 90 度，段不具有螺旋特征。
-            double screw_alignment = fabs(dot(chain_dir, bhat));//计算链的方向向量 chain_dir 与 Burgers 向量的单位向量 bhat 的点积，并取绝对值，得到 screw_alignment。这个值表示链的整体方向与 Burgers 向量的对齐程度，范围在 0 到 1 之间。screw_alignment 越接近 1，说明链越接近完全沿 Burgers 向量的方向，即具有强烈的螺旋特征；screw_alignment 越接近 0，说明链越垂直于 Burgers 向量，即不具有螺旋特征。后续会用这个值与螺旋角容差的余弦值进行比较，以判断链是否满足螺旋特征要求。
-
-            int non_screw_count = 0;//统计链上不具有螺旋特征的段的数量。后续会用这个数量与链上段的总数进行比较，以判断链是否满足整体的螺旋特征要求。具体来说，如果链上超过一半的段不具有螺旋特征，说明这个链整体上不具有足够的螺旋特征，也会被跳过。
-            for (int k = 0; k < nseg; k++) {
-                int nk  = snodes[k];
-                int nk1 = snodes[k+1];
-                Vec3 pk  = network->nodes[nk].pos;
-                Vec3 pk1 = network->cell.pbc_position(pk, network->nodes[nk1].pos);
-                Vec3 seg_dir = pk1 - pk;
-                double sl = seg_dir.norm();
-                if (sl < tol) continue;
-                if (fabs(dot(seg_dir / sl, bhat)) < scos) non_screw_count++;//对于链上每个段，计算它的方向向量 seg_dir，并归一化后与 Burgers 向量的单位向量 bhat 进行点积，得到这个段的对齐程度。如果这个值的绝对值小于螺旋角容差的余弦值 scos，说明这个段不具有足够的螺旋特征，统计到 non_screw_count 中。最后，如果 non_screw_count 超过链上段数的一半，说明这个链整体上不具有足够的螺旋特征，也会被跳过。
-            }
-            // ===== DEBUG: 螺型判定 (验证完删) =====  ← 插在这里
-            {
-                double chord_ang = acos(fmin(1.0, screw_alignment)) * 180.0 / M_PI;
-                bool rej = (screw_alignment < scos || non_screw_count > nseg / 2);
-                double amin = 1e9, amax = -1e9;
-                for (int kk = 0; kk < nseg; kk++) {
-                    Vec3 pa = network->nodes[snodes[kk]].pos;
-                    Vec3 pb = network->cell.pbc_position(pa, network->nodes[snodes[kk+1]].pos);
-                    Vec3 d  = pb - pa; double dl = d.norm();
-                    if (dl < tol) continue;
-                    double a = acos(fmin(1.0, fabs(dot(d/dl, bhat)))) * 180.0 / M_PI;
-                    amin = fmin(amin, a); amax = fmax(amax, a);
-                }
-                fprintf(stderr, "[OLD-CS] link=%d nseg=%d chord=%.1f  seg_ang=[%.1f,%.1f] "
-                                "non_screw=%d/%d -> %s\n",
-                        l, nseg, chord_ang, amin, amax, non_screw_count, nseg,
-                        rej ? "REJECT(whole arm)" : "keep");
-            }
-            // ===== DEBUG end =====
-            if (screw_alignment < scos || non_screw_count > nseg / 2) continue;//如果链的整体对齐程度 screw_alignment 小于螺旋角容差的余弦值 scos，说明链的整体方向与 Burgers 向量的夹角过大，不满足螺旋特征要求，直接跳过这个链，不将它纳入后续的螺旋链构建和分析中。或者，如果链上不具有螺旋特征的段的数量 non_screw_count 超过链上段数的一半，说明这个链整体上不具有足够的螺旋特征，也直接跳过这个链，不将它纳入后续的螺旋链构建和分析中。
-
-            // Classify mechanism type
-            MechanismType mechanism = Bulk;
-            if (network->conn[nfirst].num > 2 ||
-                network->conn[nlast].num  > 2) {
-                mechanism = Intersection;
-            }//根据链的端点节点的连接数来判断交滑移机制类型。如果链的第一个节点 nfirst 或最后一个节点 nlast 的连接数 num 大于 2，说明这个链的端点处存在位错交点，属于 Intersection 机制；否则，说明这个链完全位于体积内，没有交点，属于 Bulk 机制。 机制判定：conn[node].num 是该节点的连接度。普通位错节点连 2 段；>2 说明端点是位错结，归为 Intersection。
-
-            ScrewChain chain;//构建一个 ScrewChain 结构体实例，存储这个链的相关信息。包括链上节点 id 列表、段 id 列表、Burgers 向量、滑移面法向、交滑移机制类型等。后续会用这些信息来分析链的应力状态和计算交滑移概率。
-            chain.node_ids.assign(snodes.begin(), snodes.end());
-            chain.seg_ids.assign(ssegs.begin(), ssegs.end());
-            chain.burg        = burg;
-            chain.glide_plane = plane0;
-            chain.mechanism   = mechanism;//将链上节点 id 列表和段 id 列表分别赋值给 chain 的 node_ids 和 seg_ids。将之前计算的 Burgers 向量 burg 和参考滑移面法向 plane0 分别赋值给 chain 的 burg 和 glide_plane。将之前判断的交滑移机制类型 mechanism 赋值给 chain 的 mechanism 字段。
-
-            // For Intersection: identify junction arm and junction type
-            if (mechanism == Intersection) {
-                int jnode = (network->conn[nfirst].num > 2) ? nfirst : nlast;//对于 Intersection 机制的链，确定交点节点 jnode，即连接数大于 2 的那个端点节点。由于一个链的两个端点可能都连接数大于 2，这里优先选择 nfirst，如果 nfirst 的连接数大于 2 就选它，否则选 nlast。
-
-                Vec3 jburg(0.0);//初始化交点处的合 Burgers 向量 jburg。后续会通过累加连接到交点节点 jnode 的段的 Burgers 向量来计算 jburg。注意在累加时需要排除链上已经包含的段，以避免重复计算。
-                for (int k = 0; k < network->conn[jnode].num; k++) {
-                    int sk = network->conn[jnode].seg[k];
-                    bool in_chain = false;//检查这个段 sk 是否在当前链的段列表 ssegs 中。如果在，说明这个段已经被包含在链中，不应该再累加它的 Burgers 向量到 jburg 中；如果不在，说明这个段是连接到交点节点 jnode 的其他段，需要将它的 Burgers 向量根据连接顺序累加到 jburg 中。
-                    for (int sc : ssegs) if (sc == sk) { in_chain = true; break; }//遍历链上段的 id 列表 ssegs，检查是否存在与当前段 sk 相同的 id。如果找到相同的 id，说明 sk 在链上，将 in_chain 置为 true，并跳出循环。否则，in_chain 保持为 false。
-                    if (!in_chain) {
-                        int ord = network->conn[jnode].order[k];
-                        jburg = jburg + ord * network->segs[sk].burg;//如果 sk 不在链上，获取它在连接列表中的顺序 ord（可能是 +1 或 -1），根据 ord 的符号决定是否将 sk 的 Burgers 向量取反，然后累加到 jburg 中。这样就得到了交点处的合 Burgers 向量 jburg，它代表了交点处另一臂的 Burgers 向量。
+                int j = k + 1;
+                while (j < nseg) {
+                    double sj;
+                    Vec3 dj = seg_unit(j, sj);
+                    if (sj < tol) break;
+                    bool screw_j = (fabs(dot(dj, bhat)) >= scos);
+                    Vec3 pj = network->segs[ssegs[j]].plane;
+                    bool coplanar_j = (pj.norm() >= tol);
+                    if (coplanar_j) {
+                        Vec3 pjn = pj.normalized();
+                        coplanar_j = ((pjn - run_plane).norm() < tol ||
+                                      (pjn + run_plane).norm() < tol);
                     }
-                }
-                chain.junction_burg = jburg;//将计算得到的交点处的合 Burgers 向量 jburg 赋值给 chain 的 junction_burg 字段。 计算结另一侧所有"非本链"臂的合 Burgers 矢量。order[k] 是该 segment 相对该节点的方向符号（±1），保证 b 加和方向正确。这个合矢量决定结的类型。
-
-                for (int k = 0; k < network->conn[jnode].num; k++) {
-                    int sk = network->conn[jnode].seg[k];
-                    bool in_chain = false;//检查这个段 sk 是否在当前链的段列表 ssegs 中。如果在，说明这个段已经被包含在链中，不应该用它来判断结的滑移面；如果不在，说明这个段是连接到交点节点 jnode 的其他段，可以用它的滑移面来判断结的滑移面。由于一个交点可能连接多个段，这里只要找到一个不在链上的段，就可以用它的滑移面来判断结的滑移面。
-                    for (int sc : ssegs) if (sc == sk) { in_chain = true; break; }//遍历链上段的 id 列表 ssegs，检查是否存在与当前段 sk 相同的 id。如果找到相同的 id，说明 sk 在链上，将 in_chain 置为 true，并跳出循环。否则，in_chain 保持为 false。
-                    if (!in_chain) {
-                        chain.junction_plane = network->segs[sk].plane;
-                        break;//如果 sk 不在链上，获取它的滑移面法向量，并赋值给 chain 的 junction_plane 字段。然后跳出循环，因为只需要一个不在链上的段来判断结的滑移面。这个结的滑移面与结的 Burgers 向量一起决定了结的类型。
-                    }
+                    bool sense_j = (((dot(dj, bhat) >= 0.0) ? 1.0 : -1.0) == run_sense);
+                    if (screw_j && coplanar_j && sense_j) { rend = j; j++; }
+                    else break;
                 }
 
-                Vec3 jburg_crystal = system->crystal.Rinv * jburg.normalized();
-                if (is_100_family(jburg_crystal)) {
-                    chain.junction = Hirth;//如果交点处的合 Burgers 向量 jburg 在晶体坐标系下属于 ⟨100⟩ 家族，说明这个结是 Hirth 锁。
-                } else if (is_110_family(jburg_crystal)) {
-                    Vec3 jplane_crystal = system->crystal.Rinv
-                                         * chain.junction_plane.normalized();
-                    if (is_111_family(jplane_crystal)) {
-                        chain.junction = GlideLock;//如果交点处的合 Burgers 向量 jburg 在晶体坐标系下属于 ⟨110⟩ 家族，并且结的滑移面在晶体坐标系下属于 {111} 家族，说明这个结是 Glide 锁。
-                    } else if (is_110_family(jplane_crystal) || is_100_family(jplane_crystal)) {
-                        chain.junction = LCLock;//如果交点处的合 Burgers 向量 jburg 在晶体坐标系下属于 ⟨110⟩ 家族，并且结的滑移面在晶体坐标系下属于 {110} 或 {100} 家族，说明这个结是 L-C 锁。
-                    }
-                } else {
-                    chain.junction = UnknownLock;//如果交点处的合 Burgers 向量 jburg 在晶体坐标系下既不属于 ⟨100⟩ 家族也不属于 ⟨110⟩ 家族，说明这个结的类型无法确定，标记为 UnknownLock。
+                // --- validate and emit run [rstart .. rend] ---
+                Vec3 run_plane_crystal = system->crystal.Rinv * run_plane;
+                double run_len = 0.0;
+                for (int q = rstart; q <= rend; q++) run_len += network->seg_length(ssegs[q]);
+
+                bool keep = is_111_family(run_plane_crystal) &&
+                            (run_len >= params.minRunLength);
+                if (keep) {
+                    ScrewChain chain;
+                    // run spans segments [rstart..rend] -> nodes [rstart..rend+1]
+                    chain.node_ids.assign(snodes.begin() + rstart,
+                                          snodes.begin() + rend + 2);
+                    chain.seg_ids.assign(ssegs.begin() + rstart,
+                                         ssegs.begin() + rend + 1);
+                    chain.burg        = burg;
+                    chain.glide_plane = run_plane;
+                    classify_run(system, network, chain);   // mechanism / anchors / junction
+                    chains.push_back(std::move(chain));
                 }
+
+                k = rend + 1;   // continue past this run; the breaking segment is re-examined
             }
-
-            chains.push_back(std::move(chain));//将构建好的 chain 添加到 chains 向量中，准备返回给调用者。使用 std::move 来避免不必要的复制，提高效率。 
         }
-        return chains;//返回构建好的所有满足条件的螺旋链列表 chains。每个链都包含了它的节点和段信息、Burgers 向量、滑移面法向、交滑移机制类型，以及如果是 Intersection 机制还包含了结的 Burgers 向量和滑移面等信息。这些信息将用于后续的应力计算和交滑移分析。 按合 Burgers 矢量的族 + 面的族把结分成 Hirth / Glide lock / LC lock。std::move 把 chain 的内部 vector 资源转移进容器，省一次深拷贝。
+        return chains;
     }
 
     // -----------------------------------------------------------------------
     //  Computes Schmid and Escaig stresses for a screw chain by averaging
     //  nodal forces over all segments.
     // -----------------------------------------------------------------------
-    void compute_chain_stresses(SerialDisNet* network,
+    void compute_chain_stresses(System* system, SerialDisNet* network,
                                 const ScrewChain& chain,
                                 double burg_mag,
                                 double& schmid_glide, double& schmid_cs,
@@ -369,7 +400,7 @@ private:
         // Ensure consistent sign convention for Schmid stress calculation
         if (dot(plane, cross(burg, plane)) < 0.0) plane = -plane;//为了确保 Schmid 应力计算的一致符号约定，检查 plane 与 cross(burg, plane) 的点积是否小于零。如果小于零，说明 plane 的方向与 Burgers 向量和面法向的右手关系不一致，需要将 plane 取反。这样就保证了后续计算 Schmid 应力时，plane 的方向与 Burgers 向量和面法向的右手关系是一致的，从而得到正确的符号。 输出全部用引用参数返回。dot(plane, cross(burg,plane)) 用来固定面法向的正负号，保证 Schmid 应力符号一致。
 
-        Vec3 cs_plane = get_crossslip_plane(plane, burg);//根据当前的滑移面法向 plane 和 Burgers 向量 burg 计算交滑移面法向 cs_plane。这个函数的实现之前已经分析过，它通过检查 Burgers 向量的分量来确定交滑移面法向的方向。注意如果 Burgers 向量不满足特定的特征（比如不是轴对齐的 1/2<110>），这个函数可能会返回零向量，这时后续的 Schmid 应力和 Escaig 应力计算将无法进行，需要特殊处理。
+        Vec3 cs_plane = get_crossslip_plane(plane, burg, system->crystal.R, system->crystal.Rinv);//根据当前的滑移面法向 plane 和 Burgers 向量 burg 计算交滑移面法向 cs_plane。这个函数的实现之前已经分析过，它通过检查 Burgers 向量的分量来确定交滑移面法向的方向。注意如果 Burgers 向量不满足特定的特征（比如不是轴对齐的 1/2<110>），这个函数可能会返回零向量，这时后续的 Schmid 应力和 Escaig 应力计算将无法进行，需要特殊处理。
         if (cs_plane.norm() < 1e-6) {
             schmid_glide = schmid_cs = escaig_glide = escaig_cs = 0.0;
             total_length = 0.0;
@@ -396,12 +427,20 @@ private:
 
         Vec3 glide_line = cross(burg, plane).normalized();//根据 Burgers 向量和滑移面法向计算滑移线方向 glide_line，并归一化。滑移线是 Burgers 向量和面法向的叉积方向，代表了位错在线上滑移的方向。后续会将 total_force 投影到这个方向上，得到平均的 Schmid 滑移应力。 glide面内的刃方向
         Vec3 cs_line    = cross(burg, cs_plane).normalized();//根据 Burgers 向量和交滑移面法向计算交滑移线方向 cs_line，并归一化。交滑移线是 Burgers 向量和交滑移面法向的叉积方向，代表了位错在线上交滑移的方向。后续会将 total_force 投影到这个方向上，得到平均的 Schmid 交滑移应力。交滑移面内的刃方向
-        if (total_length > 1e-15) {
-            schmid_glide = dot(total_force, glide_line) / total_length;
-            schmid_cs    = dot(total_force, cs_line)    / total_length;
+        // DIMENSIONAL FIX (test_3): the accumulated nodal force is a
+        // Peach-Koehler force, whose per-length glide component equals tau*b
+        // (resolved shear stress times Burgers magnitude). Dividing only by L
+        // therefore yields tau*b, NOT a stress -- inconsistent with both the
+        // Escaig stress (compute_escaig_stress divides by b*L) and the
+        // mu*b/(10L) threshold in handle_bulk. Divide by (L*b) so that
+        // schmid_glide/schmid_cs are TRUE resolved shear stresses, matching the
+        // Escaig normalization and the threshold dimension.
+        if (total_length > 1e-15 && burg_mag > 1e-15) {
+            schmid_glide = dot(total_force, glide_line) / (total_length * burg_mag);
+            schmid_cs    = dot(total_force, cs_line)    / (total_length * burg_mag);
         } else {
             schmid_glide = schmid_cs = 0.0;
-        }//如果链的总长度 total_length 大于容差，说明链具有有效的长度，可以进行 Schmid 应力的计算。将 total_force 分别投影到滑移线方向 glide_line 和交滑移线方向 cs_line 上，并除以 total_length，得到平均的 Schmid 滑移应力 schmid_glide 和平均的 Schmid 交滑移应力 schmid_cs。这样就得到了链上的平均 Schmid 应力，代表了作用在链上的整体应力状态。如果链的总长度小于容差，说明链过短，无法进行可靠的 Schmid 应力计算，将 schmid_glide 和 schmid_cs 设置为零。 Schmid 应力：合力投影到刃方向后除以总长。这里只除长度、没除 b，与 Escaig 不一致（量纲问题）。
+        }//量纲修复：节点力是 PK 力，其单位长度的滑移分量 = tau*b。只除 L 得到的是 tau*b 而非应力，与 Escaig(除 b*L)及 mu*b/(10L) 阈值都对不上。改为除以 L*b，使 Schmid 成为真实分切应力，量纲与 Escaig、阈值一致。条件2(比值)不受影响。
 
         escaig_glide = compute_escaig_stress(total_force, glide_bdir, plane,    burg_mag, total_length);
         escaig_cs    = compute_escaig_stress(total_force, cs_bdir,    cs_plane, burg_mag, total_length);//根据 Hussein 等人论文中第 2 节的描述，计算链的平均 Escaig 滑移应力 escaig_glide 和平均 Escaig 交滑移应力 escaig_cs。这个计算需要 total_force、Burgers 方向、面法向、Burgers 模长和链长等参数。具体的计算公式在 compute_escaig_stress 函数中实现，通常涉及将 total_force 投影到 Burgers 方向上，并根据面法向和链长进行适当的归一化。这样就得到了链上的平均 Escaig 应力，代表了作用在链上的刃分量的应力状态。
@@ -419,8 +458,8 @@ private:
         int nfirst = chain.node_ids.front();//获取链上第一个节点的 id，作为链的起点节点。后续会用这个节点的信息来确定枢轴点 pivot，以及在更新节点位置时进行特殊处理（如果这个节点受约束）。front() 是 std::vector 的成员函数，返回第一个元素的引用。
         int nlast  = chain.node_ids.back();//获取链上最后一个节点的 id，作为链的终点节点。后续会用这个节点的信息来确定枢轴点 pivot，以及在更新节点位置时进行特殊处理（如果这个节点受约束）。back() 是 std::vector 的成员函数，返回最后一个元素的引用。
 
-        bool first_free = (network->nodes[nfirst].constraint == UNCONSTRAINED);//检查链的第一个节点 nfirst 是否是自由节点，即它的约束类型是否为 UNCONSTRAINED。如果是自由节点，说明它可以移动；如果不是自由节点，说明它受约束，不能移动。在后续更新节点位置时，如果这个节点受约束，将不会修改它的位置。这个信息对于确定枢轴点 pivot 和更新节点位置非常重要。
-        bool last_free  = (network->nodes[nlast].constraint  == UNCONSTRAINED);//检查链的最后一个节点 nlast 是否是自由节点，即它的约束类型是否为 UNCONSTRAINED。如果是自由节点，说明它可以移动；如果不是自由节点，说明它受约束，不能移动。在后续更新节点位置时，如果这个节点受约束，将不会修改它的位置。这个信息对于确定枢轴点 pivot 和更新节点位置非常重要。
+        bool first_free = (!chain.start_anchor) && (network->nodes[nfirst].constraint == UNCONSTRAINED);//检查链的第一个节点 nfirst 是否是自由节点，即它的约束类型是否为 UNCONSTRAINED。如果是自由节点，说明它可以移动；如果不是自由节点，说明它受约束，不能移动。在后续更新节点位置时，如果这个节点受约束，将不会修改它的位置。这个信息对于确定枢轴点 pivot 和更新节点位置非常重要。
+        bool last_free  = (!chain.end_anchor)  && (network->nodes[nlast].constraint  == UNCONSTRAINED);//检查链的最后一个节点 nlast 是否是自由节点，即它的约束类型是否为 UNCONSTRAINED。如果是自由节点，说明它可以移动；如果不是自由节点，说明它受约束，不能移动。在后续更新节点位置时，如果这个节点受约束，将不会修改它的位置。这个信息对于确定枢轴点 pivot 和更新节点位置非常重要。
 
         Vec3 pivot(0.0);//初始化枢轴点 pivot 为零向量。后续会根据链的端点节点的约束情况来计算 pivot 的位置。pivot 是交滑移操作中的一个参考点，节点的位置将相对于这个点进行更新。
         Vec3 ref_pos = network->nodes[nfirst].pos;//获取链的第一个节点 nfirst 的位置，作为计算枢轴点 pivot 的参考位置 ref_pos。后续在计算 pivot 时会考虑周期边界条件，使得 pivot 的位置在 ref_pos 的附近。这个参考位置的选择是为了确保在更新节点位置时，能够正确处理周期边界条件，避免节点位置跨越边界时出现错误。
@@ -460,7 +499,7 @@ private:
     {
         double burg_mag = system->params.burgmag;
         double schmid_glide, schmid_cs, escaig_glide, escaig_cs, total_length;
-        compute_chain_stresses(network, chain, burg_mag,
+        compute_chain_stresses(system, network, chain, burg_mag,
                                schmid_glide, schmid_cs,
                                escaig_glide, escaig_cs, total_length);
         if (total_length < 1e-15) return;//如果链的总长度 total_length 小于容差，说明链过短，无法进行可靠的应力计算和交滑移分析，直接返回，不执行任何操作。
@@ -486,7 +525,7 @@ private:
 
         Vec3 plane = chain.glide_plane.normalized();//如果决定执行交滑移，首先获取链的当前滑移面法向，并归一化。这个 plane 将用于计算新的交滑移面法向。注意这里假设 chain.glide_plane 已经是一个有效的法向量，如果它的模长接近零，可能会导致数值问题。后续会用这个面法向来计算交滑移面法向和执行交滑移操作。
         if (dot(plane, cross(chain.burg, plane)) < 0.0) plane = -plane;//为了确保 Schmid 应力计算的一致符号约定，检查 plane 与 cross(chain.burg, plane) 的点积是否小于零。如果小于零，说明 plane 的方向与 Burgers 向量和面法向的右手关系不一致，需要将 plane 取反。这样就保证了后续计算 Schmid 应力时，plane 的方向与 Burgers 向量和面法向的右手关系是一致的，从而得到正确的符号。 输出全部用引用参数返回。dot(plane, cross(burg,plane)) 用来固定面法向的正负号，保证 Schmid 应力符号一致。
-        Vec3 cs_plane = get_crossslip_plane(plane, chain.burg);//根据当前的滑移面法向 plane 和 Burgers 向量 chain.burg 计算新的交滑移面法向 cs_plane。这个函数的实现之前已经分析过，它通过检查 Burgers 向量的分量来确定交滑移面法向的方向。注意如果 Burgers 向量不满足特定的特征（比如不是轴对齐的 1/2<110>），这个函数可能会返回零向量，这时后续的 Schmid 应力和 Escaig 应力计算将无法进行，需要特殊处理。
+        Vec3 cs_plane = get_crossslip_plane(plane, chain.burg, system->crystal.R, system->crystal.Rinv);//根据当前的滑移面法向 plane 和 Burgers 向量 chain.burg 计算新的交滑移面法向 cs_plane。这个函数的实现之前已经分析过，它通过检查 Burgers 向量的分量来确定交滑移面法向的方向。注意如果 Burgers 向量不满足特定的特征（比如不是轴对齐的 1/2<110>），这个函数可能会返回零向量，这时后续的 Schmid 应力和 Escaig 应力计算将无法进行，需要特殊处理。
         if (cs_plane.norm() < 1e-6) return;//如果计算得到的新的交滑移面法向 cs_plane 的模长小于容差，说明无法确定有效的交滑移面，这时直接返回，不执行交滑移操作。这样就避免了后续计算中使用无效的 cs_plane 导致的数值问题。
         execute_crossslip(network, chain, cs_plane, system->dEp);//调用 execute_crossslip 来执行交滑移操作，传入网络、链、计算得到的新的交滑移面法向 cs_plane，以及系统的塑性应变增量 dEp。这个函数会更新网络中链上节点的位置和段的信息，实现交滑移操作。这样就完成了 Bulk 机制下的交滑移分析和操作。
     }
@@ -503,7 +542,7 @@ private:
         const double tol = 1e-6;
         Vec3 plane = chain.glide_plane.normalized();
         if (dot(plane, cross(chain.burg, plane)) < 0.0) plane = -plane;
-        Vec3 cs_plane = get_crossslip_plane(plane, chain.burg);//计算交滑移面法向 cs_plane，并进行符号约定处理。这个 cs_plane 将用于后续的交滑移分析和操作。注意如果 Burgers 向量不满足特定的特征（比如不是轴对齐的 1/2<110>），这个函数可能会返回零向量，这时后续的 Schmid 应力和 Escaig 应力计算将无法进行，需要特殊处理。
+        Vec3 cs_plane = get_crossslip_plane(plane, chain.burg, system->crystal.R, system->crystal.Rinv);//计算交滑移面法向 cs_plane，并进行符号约定处理。这个 cs_plane 将用于后续的交滑移分析和操作。注意如果 Burgers 向量不满足特定的特征（比如不是轴对齐的 1/2<110>），这个函数可能会返回零向量，这时后续的 Schmid 应力和 Escaig 应力计算将无法进行，需要特殊处理。
         if (cs_plane.norm() < tol) return;//如果计算得到的交滑移面法向 cs_plane 的模长小于容差 tol，说明无法确定有效的交滑移面，这时直接返回，不执行交滑移操作。这样就避免了后续计算中使用无效的 cs_plane 导致的数值问题。
 
         // Repulsive intersection (Hussein et al. Sec. 2): spontaneous and athermal
@@ -547,7 +586,7 @@ private:
         }
 
         double schmid_g, schmid_c, escaig_g, escaig_c, total_length;//计算链的 Schmid 应力和 Escaig 应力，以及链的总长度 total_length。这个计算将使用之前分析过的 compute_chain_stresses 函数，根据链上的节点力、Burgers 向量、滑移面法向和交滑移面法向来计算这些应力值。计算得到的 schmid_g、schmid_c、escaig_g 和 escaig_c 将用于后续的热激活概率计算，以决定是否执行交滑移操作。
-        compute_chain_stresses(network, chain, burg_mag,
+        compute_chain_stresses(system, network, chain, burg_mag,
                                schmid_g, schmid_c, escaig_g, escaig_c,
                                total_length);
 

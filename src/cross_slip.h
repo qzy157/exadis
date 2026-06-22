@@ -131,5 +131,6 @@ struct BCCCrossSlipParams {
 #include "cross_slip_serial.h"
 #include "cross_slip_parallel.h"
 #include "cross_slip_fcc_thermal.h"
+#include "cross_slip_fcc_test.h"
 
 #endif
