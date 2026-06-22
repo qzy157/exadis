@@ -826,6 +826,17 @@ CrossSlipBind make_cross_slip_fcc_thermal(Params& params, ForceBind& forcebind,
     return CrossSlipBind(crossslip, params, cutoff);
 }
 
+CrossSlipBind make_cross_slip_fcc_wansheng(Params& params, ForceBind& forcebind,
+                                           CrossSlipFCCWansheng::Params fcc_params = CrossSlipFCCWansheng::Params())
+{
+    System* system = make_system(new SerialDisNet(), Crystal(params.crystal), params);
+    Force* force = forcebind.force;
+    double cutoff = forcebind.neighbor_cutoff;
+    CrossSlip* crossslip = new CrossSlipFCCWansheng(system, force, fcc_params);
+    exadis_delete(system);
+    return CrossSlipBind(crossslip, params, cutoff);
+}
+
 CrossSlipBind make_cross_slip_fcc_test(Params& params, ForceBind& forcebind,
                                        CrossSlipFCCTest::Params fcc_params = CrossSlipFCCTest::Params())
 {
@@ -1313,6 +1324,36 @@ PYBIND11_MODULE(pyexadis, m) {
           "Instantiate thermally-activated FCC cross-slip",
           py::arg("params"), py::arg("force"),
           py::arg("fcc_params") = CrossSlipFCCThermal::Params());
+
+    py::class_<CrossSlipFCCWansheng::Params>(m, "CrossSlipFCCWansheng_Params")
+        .def(py::init<>())
+        .def_readwrite("temperature",              &CrossSlipFCCWansheng::Params::temperature)
+        .def_readwrite("evalFrequency",            &CrossSlipFCCWansheng::Params::evalFrequency)
+        .def_readwrite("bulkActivationEnergy",     &CrossSlipFCCWansheng::Params::bulkActivationEnergy)
+        .def_readwrite("bulkActivationVolume",     &CrossSlipFCCWansheng::Params::bulkActivationVolume)
+        .def_readwrite("bulkAttemptFrequency",     &CrossSlipFCCWansheng::Params::bulkAttemptFrequency)
+        .def_readwrite("bulkReferenceLength",      &CrossSlipFCCWansheng::Params::bulkReferenceLength)
+        .def_readwrite("hirthActivationEnergy",    &CrossSlipFCCWansheng::Params::hirthActivationEnergy)
+        .def_readwrite("hirthActivationVolume",    &CrossSlipFCCWansheng::Params::hirthActivationVolume)
+        .def_readwrite("hirthAttemptFrequency",    &CrossSlipFCCWansheng::Params::hirthAttemptFrequency)
+        .def_readwrite("hirthReferenceLength",     &CrossSlipFCCWansheng::Params::hirthReferenceLength)
+        .def_readwrite("hirthEffectiveLength",     &CrossSlipFCCWansheng::Params::hirthEffectiveLength)
+        .def_readwrite("glideLockActivationEnergy",&CrossSlipFCCWansheng::Params::glideLockActivationEnergy)
+        .def_readwrite("glideLockActivationVolume",&CrossSlipFCCWansheng::Params::glideLockActivationVolume)
+        .def_readwrite("glideLockAttemptFrequency",&CrossSlipFCCWansheng::Params::glideLockAttemptFrequency)
+        .def_readwrite("glideLockReferenceLength", &CrossSlipFCCWansheng::Params::glideLockReferenceLength)
+        .def_readwrite("glideLockEffectiveLength", &CrossSlipFCCWansheng::Params::glideLockEffectiveLength)
+        .def_readwrite("lcLockActivationEnergy",   &CrossSlipFCCWansheng::Params::lcLockActivationEnergy)
+        .def_readwrite("lcLockActivationVolume",   &CrossSlipFCCWansheng::Params::lcLockActivationVolume)
+        .def_readwrite("lcLockAttemptFrequency",   &CrossSlipFCCWansheng::Params::lcLockAttemptFrequency)
+        .def_readwrite("lcLockReferenceLength",    &CrossSlipFCCWansheng::Params::lcLockReferenceLength)
+        .def_readwrite("lcLockEffectiveLength",    &CrossSlipFCCWansheng::Params::lcLockEffectiveLength)
+        .def_readwrite("screwAngleTolerance",      &CrossSlipFCCWansheng::Params::screwAngleTolerance)
+        .def_readwrite("minChainSegments",         &CrossSlipFCCWansheng::Params::minChainSegments);
+    m.def("make_cross_slip_fcc_wansheng", &make_cross_slip_fcc_wansheng,
+          "Instantiate Wansheng FCC cross-slip",
+          py::arg("params"), py::arg("force"),
+          py::arg("fcc_params") = CrossSlipFCCWansheng::Params());
 
     py::class_<CrossSlipFCCTest::Params>(m, "CrossSlipFCCTest_Params")
         .def(py::init<>())
