@@ -348,7 +348,8 @@ private:
 
                 bool keep = is_111_family(run_plane_crystal) &&
                             (run_len >= params.minRunLength);
-                 // ===== DEBUG: run 提取 (验证完删) =====  ← 插在这里
+                 // ===== DEBUG: run 提取 (已注释；调试时取消注释即可) =====
+                /*
                 {
                     double s_, amin = 1e9, amax = -1e9;
                     for (int q = rstart; q <= rend; q++) {
@@ -363,6 +364,7 @@ private:
                             (int)is_111_family(run_plane_crystal), params.minRunLength,
                             keep ? "KEEP-as-chain" : "drop");
                 }
+                */
                 // ===== DEBUG end =====
                 if (keep) {
                     ScrewChain chain;

@@ -278,7 +278,8 @@ private:
                 int kend = kpos;                                 // 螺型段区间 [kstart, kend)
                 int sub_nseg = kend - kstart;
 
-                // ===== DEBUG: 新螺型切分 (验证完删) =====
+                // ===== DEBUG: 新螺型切分 (已注释；调试时取消注释即可) =====
+                /*
                 {
                     double amin = 1e9, amax = -1e9;
                     for (int kk = kstart; kk < kend; kk++) {
@@ -293,6 +294,7 @@ private:
                             l, kstart, kend, sub_nseg, amin, amax,
                             (sub_nseg < params.minChainSegments) ? "drop(<min)" : "keep");
                 }
+                */
                 // ===== DEBUG end =====
 
                 if (sub_nseg < params.minChainSegments) continue;  // 论文 p.4：最少 4 段

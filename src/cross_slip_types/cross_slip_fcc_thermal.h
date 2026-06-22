@@ -271,7 +271,8 @@ private:
                 if (sl < tol) continue;
                 if (fabs(dot(seg_dir / sl, bhat)) < scos) non_screw_count++;//对于链上每个段，计算它的方向向量 seg_dir，并归一化后与 Burgers 向量的单位向量 bhat 进行点积，得到这个段的对齐程度。如果这个值的绝对值小于螺旋角容差的余弦值 scos，说明这个段不具有足够的螺旋特征，统计到 non_screw_count 中。最后，如果 non_screw_count 超过链上段数的一半，说明这个链整体上不具有足够的螺旋特征，也会被跳过。
             }
-            // ===== DEBUG: 螺型判定 (验证完删) =====  ← 插在这里
+            // ===== DEBUG: 螺型判定 (已注释；调试时取消注释即可) =====
+            /*
             {
                 double chord_ang = acos(fmin(1.0, screw_alignment)) * 180.0 / M_PI;
                 bool rej = (screw_alignment < scos || non_screw_count > nseg / 2);
@@ -289,6 +290,7 @@ private:
                         l, nseg, chord_ang, amin, amax, non_screw_count, nseg,
                         rej ? "REJECT(whole arm)" : "keep");
             }
+            */
             // ===== DEBUG end =====
             if (screw_alignment < scos || non_screw_count > nseg / 2) continue;//如果链的整体对齐程度 screw_alignment 小于螺旋角容差的余弦值 scos，说明链的整体方向与 Burgers 向量的夹角过大，不满足螺旋特征要求，直接跳过这个链，不将它纳入后续的螺旋链构建和分析中。或者，如果链上不具有螺旋特征的段的数量 non_screw_count 超过链上段数的一半，说明这个链整体上不具有足够的螺旋特征，也直接跳过这个链，不将它纳入后续的螺旋链构建和分析中。
 
