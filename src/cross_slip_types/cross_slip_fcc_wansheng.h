@@ -203,174 +203,194 @@ private:
     }//根据 Arrhenius 公式计算热激活的交滑移概率。输入参数包括激活能 E_a、激活体积 V_a、Esclaig 应力差 dSigma_E、温度、尝试频率、时间步长、链长和参考长度。输出是一个概率值，表示在给定条件下发生交滑移的概率。 就是注释那条 Arrhenius 公式。V_a*dSigma_E 是应力对势垒的降低量，dSigma_E>0 时指数变大、概率升高。前面乘 ν·dt·(L/L_ref)：长链有更多成核位点、概率正比于长度。
 
     // -----------------------------------------------------------------------
-    //  Builds all screw chain candidates from physical dislocation links.
-    //  Applies FCC crystallographic filters and the screw angle criterion.
+    //  Builds screw-RUN chain candidates from physical dislocation links.
+    //
+    //  修复要点（相对旧 wansheng）：删除"整臂共面(consistent_plane)"与
+    //  "整臂 is_111(plane0)"两道前置闸门。旧实现只要臂上任一段不在第一段的
+    //  {111} 面上，就 continue 把整条物理臂丢弃——这与 thermal 的"整臂弦向判螺型
+    //  后整条丢弃"是同一失效模式，导致跨面弯臂（部分已交滑移的臂）被整条扔掉，
+    //  使本模块退化成 thermal。
+    //
+    //  现改为逐 segment 沿臂扫描，切出"最长连续 螺型(<screwAngleTolerance) +
+    //  同 {111} 面 + 同线向(line sense)"的 run，每个 run 单独成一条子链；面的判据
+    //  下放到 run 内部逐段核对，换面即断 run、可在新面上重开新 run。这样跨面弯臂
+    //  被拆成 A 面螺型子链 + B 面螺型子链，不再被整条丢弃。
+    //  过滤强度仍沿用 wansheng 的 minChainSegments（按 run 内 segment 数），
+    //  区别于 test 版的 minRunLength（按物理长度，单位 b）。
     // -----------------------------------------------------------------------
     std::vector<ScrewChain> build_screw_chains(System* system,
                                                SerialDisNet* network)
     {
         const double tol  = 1e-6;
-        const double scos = cos(params.screwAngleTolerance * M_PI / 180.0);//螺旋角容差的余弦值，用于判断段是否具有足够的螺旋特征。比如 15 度对应 cos(15°) ≈ 0.9659，意味着段与 Burgers 向量的夹角必须小于 15 度才能被认为是螺旋段。
+        const double scos = cos(params.screwAngleTolerance * M_PI / 180.0);//15° 的余弦；逐 segment 判螺型用。
 
-        SerialDisNet::DisLinks dislinks = network->physical_links();//获取物理位错链信息，包括链上节点和段的 id 列表。每条链至少包含一个段和两个节点。 取所有"物理链"（两结点之间的一串segment）
-        std::vector<ScrewChain> chains;//存储满足条件的螺旋链
+        SerialDisNet::DisLinks dislinks = network->physical_links();//取所有"物理链"（结到结的一整条臂）
+        std::vector<ScrewChain> chains;
 
         for (int l = 0; l < dislinks.number_of_links; l++) {
-            const auto& snodes = dislinks.links_nodes[l];//链上节点 id 列表
-            const auto& ssegs  = dislinks.links_segs[l];//链上段 id 列表
+            const auto& snodes = dislinks.links_nodes[l];//臂上节点 id（比段多 1 个）
+            const auto& ssegs  = dislinks.links_segs[l];//臂上段 id
             if (ssegs.empty()) continue;
-            int nseg = (int)ssegs.size();//链上段的数量 遍历每条物理链。对于每条链，首先检查是否为空链（没有段），如果是则跳过。然后获取链上节点和段的 id 列表，并计算段的数量 nseg。
+            int nseg = (int)ssegs.size();
 
-            // Burgers vector, sign-corrected for traversal direction
-            int s0 = ssegs[0];//链上第一个段的 id，根据这个段的 Burgers 向量来确定整个链的 Burgers 向量。由于链上段的方向可能不一致，需要根据第一个段的节点顺序来修正 Burgers 向量的符号。具体来说，取第一个段 s0 的两个节点 id，判断哪个节点在前（snodes[0]）哪个在后（snodes[1]），如果 s0 的 n2 是 snodes[0]，说明第一个段的方向与节点列表的顺序相反，需要将 Burgers 向量取反。
-            int n0 = snodes[0];//链上第一个节点的 id
-            Vec3 burg = network->segs[s0].burg;//获取第一个段的 Burgers 向量
-            if (network->segs[s0].n2 == n0) burg = -burg;//如果第一个段的第二个节点是链上第一个节点，说明段的方向与节点列表的顺序相反，需要将 Burgers 向量取反。这样就确保了整个链的 Burgers 向量与节点列表的顺序一致。 取第一个 segment 的 Burgers 矢量。位错 segment 有方向（n1→n2），若遍历起点 n0 恰好是 segment 的终点 n2，说明方向相反，b 取负，保证沿链方向一致。
+            // --- 整臂 Burgers 矢量（按遍历方向修正符号）---
+            int s0 = ssegs[0];
+            int n0 = snodes[0];
+            Vec3 burg = network->segs[s0].burg;
+            if (network->segs[s0].n2 == n0) burg = -burg;//若首段方向与遍历方向相反则取负，保证沿臂方向一致。
 
-            // Reject links with inconsistent glide planes
-            Vec3 plane0 = network->segs[s0].plane;//获取第一个段的滑移面法向量，作为整个链的参考滑移面。后续会检查链上其他段的滑移面是否与这个参考面一致。
-            if (plane0.norm() < tol) continue;//如果第一个段的滑移面法向量的模长小于容差，说明这个段没有有效的滑移面信息，无法用来判断链的滑移面一致性，因此跳过这个链。否则，将这个参考滑移面归一化，后续会用它来检查链上其他段的滑移面是否一致。
-            plane0 = plane0.normalized();//将第一个段的滑移面法向量归一化，得到单位向量 plane0 作为整个链的参考滑移面。后续会检查链上其他段的滑移面是否与这个参考面一致。对于 FCC 位错，所有段应该共享同一 {111} 面，因此它们的法向量应该相同或相反（即 plane0 或 -plane0）。
-
-            bool consistent_plane = true;//标志位，表示链上所有段的滑移面是否与参考面一致。初始值为 true，后续会检查链上每个段的滑移面，如果发现不一致的情况（既不接近 plane0 也不接近 -plane0），就将这个标志置为 false，并跳出循环。
-            for (int k = 0; k < nseg; k++) {
-                int sk = ssegs[k];
-                Vec3 p = network->segs[sk].plane;
-                if (p.norm() < tol) { consistent_plane = false; break; }
-                p = p.normalized();
-                if ((p - plane0).norm() > tol && (p + plane0).norm() > tol) {
-                    consistent_plane = false; break;
-                }//对于链上每个段，获取它的滑移面法向量 p，并检查它是否与参考面 plane0 一致。具体来说，首先检查 p 的模长是否有效，如果小于容差，说明这个段没有有效的滑移面信息，直接标记为不一致并跳出循环。否则，将 p 归一化后，检查它与 plane0 的差和与 -plane0 的差是否都小于容差。如果两者都不接近，说明这个段的滑移面与参考面不一致，也标记为不一致并跳出循环。只有当链上所有段的滑移面都接近 plane0 或 -plane0 时，consistent_plane 才保持为 true，表示这个链满足 FCC 位错的滑移面一致性要求。
-            }
-            if (!consistent_plane) continue;//如果链上存在滑移面不一致的段，说明这个链不满足 FCC 位错的特征，直接跳过这个链，不将它纳入后续的螺旋链构建和分析中。
-
-            // FCC filter: Burgers must be 1/2<110>, plane must be {111}
-            Vec3 burg_crystal  = system->crystal.Rinv * burg.normalized();
-            if (!is_110_family(burg_crystal)) continue;//将 Burgers 向量从实验室坐标系转换到晶体坐标系，得到 burg_crystal。然后检查它是否属于 FCC 晶体的 ⟨110⟩ 家族，即是否满足 1/2<110> 的特征。如果不满足，说明这个链的 Burgers 向量不符合 FCC 位错的特征，直接跳过这个链，不将它纳入后续的螺旋链构建和分析中。
-            Vec3 plane_crystal = system->crystal.Rinv * plane0;//FCC 过滤。关键：先用 Rinv 把向量转到晶体系再判族，这是正确做法——但对照前面 get_crossslip_plane 用的是实验室系，这就是不一致的根源。
-            if (!is_111_family(plane_crystal)) continue;//将参考滑移面法向 plane0 从实验室坐标系转换到晶体坐标系，得到 plane_crystal。然后检查它是否属于 FCC 晶体的 ⟨111⟩ 家族，即是否满足 {111} 的特征。如果不满足，说明这个链的滑移面不符合 FCC 位错的特征，直接跳过这个链，不将它纳入后续的螺旋链构建和分析中。
-
-            // === 螺型判定：把整条物理臂切成若干"极大连续螺型段"子链 ===
-            // 论文 Sec.2：检测"尽可能长的螺型链"(sequences of segments)；
-            // 论文 p.3：逐 segment 判 15°——某段与 b 夹角 <15° 即为螺型段。
-            // 修正1：15° 是 segment 的属性，链在"超 15° 的那一段"处断开，
-            //        断点落在最后一个螺型段与第一个非螺型段之间的结点上。
-            // 修正2：一条臂可产出多条子链，断开后跳过非螺型段、继续找下一段 run，
-            //        而不是接回同一条链（论文用复数 chains）。
+            // FCC 过滤：只在整臂上过滤 Burgers（b∈1/2<110>）。
+            // 面的 {111} / 共面判据一律下放到"逐 run"处理，见下方 run 扫描。
+            Vec3 burg_crystal = system->crystal.Rinv * burg.normalized();//转到晶体系再判族（正确做法）。
+            if (!is_110_family(burg_crystal)) continue;
             Vec3 bhat = burg.normalized();
 
-            // (a) 逐段标记是否为螺型段（segment 属性，而非整臂弦）
-            std::vector<char> is_screw(nseg, 0);
-            for (int k = 0; k < nseg; k++) {
-                Vec3 pa = network->nodes[snodes[k]].pos;
-                Vec3 pb = network->cell.pbc_position(pa, network->nodes[snodes[k+1]].pos);
-                Vec3 d  = pb - pa;
-                double dl = d.norm();
-                is_screw[k] = (dl > tol && fabs(dot(d / dl, bhat)) >= scos) ? 1 : 0;
-            }
+            // PBC-aware：返回臂上第 k 段的单位方向，长度经 len_out 带出。
+            auto seg_unit = [&](int k, double& len_out) -> Vec3 {
+                Vec3 pk  = network->nodes[snodes[k]].pos;
+                Vec3 pk1 = network->cell.pbc_position(pk, network->nodes[snodes[k+1]].pos);
+                Vec3 d = pk1 - pk;
+                len_out = d.norm();
+                return (len_out > tol) ? d / len_out : Vec3(0.0);
+            };
 
-            // (b) 提取极大连续螺型 run：每个区间 [kstart, kend) 各成一条子链
-            int kpos = 0;
-            while (kpos < nseg) {
-                if (!is_screw[kpos]) { kpos++; continue; }       // 非螺型段 -> 跳过
-                int kstart = kpos;
-                while (kpos < nseg && is_screw[kpos]) kpos++;     // 一直吃到非螺型为止
-                int kend = kpos;                                 // 螺型段区间 [kstart, kend)
-                int sub_nseg = kend - kstart;
+            // --- 沿臂扫描，切出"最长连续 螺型+同面+同向" run，每个 run 单独成链 ---
+            int k = 0;
+            while (k < nseg) {
+                double sl;
+                Vec3 dir = seg_unit(k, sl);
+                Vec3 plane_k = network->segs[ssegs[k]].plane;
+                bool screw_k = (sl > tol) && (fabs(dot(dir, bhat)) >= scos);//本段逐段判螺型（非整臂弦）
+                if (!screw_k || plane_k.norm() < tol) { k++; continue; }//非螺型段/无有效面 -> 跳过，不开 run
 
-                // ===== DEBUG: 新螺型切分 (已注释；调试时取消注释即可) =====
+                // 在第 k 段开一条 run
+                int rstart = k;
+                int rend   = k;                                   // run 的最后一段（含）
+                Vec3 run_plane = plane_k.normalized();            // 本 run 的 {111} 面（逐 run，而非整臂 plane0）
+                double run_sense = (dot(dir, bhat) >= 0.0) ? 1.0 : -1.0;//本 run 的线向（同向才并入）
+
+                int j = k + 1;
+                while (j < nseg) {
+                    double sj;
+                    Vec3 dj = seg_unit(j, sj);
+                    if (sj < tol) break;
+                    bool screw_j = (fabs(dot(dj, bhat)) >= scos);           // (a) 仍是螺型
+                    Vec3 pj = network->segs[ssegs[j]].plane;
+                    bool coplanar_j = (pj.norm() >= tol);                   // (b) 与本 run 同面
+                    if (coplanar_j) {
+                        Vec3 pjn = pj.normalized();
+                        coplanar_j = ((pjn - run_plane).norm() < tol ||
+                                      (pjn + run_plane).norm() < tol);
+                    }
+                    bool sense_j = (((dot(dj, bhat) >= 0.0) ? 1.0 : -1.0) == run_sense);// (c) 同线向
+                    if (screw_j && coplanar_j && sense_j) { rend = j; j++; }//三者皆满足才并入本 run
+                    else break;                                             //否则在此断开
+                }
+
+                int sub_nseg = rend - rstart + 1;//本 run 的 segment 数
+
+                // ===== DEBUG: 新 run 切分 (已注释；调试时取消注释即可) =====
                 /*
                 {
-                    double amin = 1e9, amax = -1e9;
-                    for (int kk = kstart; kk < kend; kk++) {
-                        Vec3 pa = network->nodes[snodes[kk]].pos;
-                        Vec3 pb = network->cell.pbc_position(pa, network->nodes[snodes[kk+1]].pos);
-                        Vec3 dd = pb - pa; double dl = dd.norm();
-                        if (dl < tol) continue;
-                        double a = acos(fmin(1.0, fabs(dot(dd/dl, bhat)))) * 180.0 / M_PI;
+                    double s_, amin = 1e9, amax = -1e9;
+                    for (int q = rstart; q <= rend; q++) {
+                        Vec3 dq = seg_unit(q, s_);
+                        if (s_ < tol) continue;
+                        double a = acos(fmin(1.0, fabs(dot(dq, bhat)))) * 180.0 / M_PI;
                         amin = fmin(amin, a); amax = fmax(amax, a);
                     }
-                    fprintf(stderr, "[WS-CS] link=%d run=[%d,%d) sub_nseg=%d seg_ang=[%.1f,%.1f] -> %s\n",
-                            l, kstart, kend, sub_nseg, amin, amax,
-                            (sub_nseg < params.minChainSegments) ? "drop(<min)" : "keep");
+                    Vec3 rpc = system->crystal.Rinv * run_plane;
+                    fprintf(stderr, "[WS-CS] link=%d run[seg %d..%d] (%d segs) seg_ang=[%.1f,%.1f] "
+                                    "{111}=%d minSeg=%d -> %s\n",
+                            l, rstart, rend, sub_nseg, amin, amax,
+                            (int)is_111_family(rpc), params.minChainSegments,
+                            (is_111_family(rpc) && sub_nseg >= params.minChainSegments)
+                                ? "KEEP-as-chain" : "drop");
                 }
                 */
                 // ===== DEBUG end =====
 
-                if (sub_nseg < params.minChainSegments) continue;  // 论文 p.4：最少 4 段
+                // 逐 run 的 {111} 判据（取代旧整臂 is_111(plane0)）+ wansheng 的
+                // minChainSegments 长度过滤（论文 p.4：过短的链会在两面间反复振荡）。
+                Vec3 run_plane_crystal = system->crystal.Rinv * run_plane;
+                bool keep = is_111_family(run_plane_crystal) &&
+                            (sub_nseg >= params.minChainSegments);
 
-                // 子链的节点/段列表（节点数比段数多 1）
-                std::vector<int> sub_nodes(snodes.begin() + kstart,
-                                           snodes.begin() + kend + 1);
-                std::vector<int> sub_segs (ssegs.begin()  + kstart,
-                                           ssegs.begin()  + kend);
+                if (keep) {
+                    // run 跨 segment [rstart..rend] -> 节点 [rstart..rend+1]
+                    std::vector<int> sub_nodes(snodes.begin() + rstart,
+                                               snodes.begin() + rend + 2);
+                    std::vector<int> sub_segs (ssegs.begin()  + rstart,
+                                               ssegs.begin()  + rend + 1);
 
-                int nfirst = sub_nodes.front();
-                int nlast  = sub_nodes.back();
+                    int nfirst = sub_nodes.front();
+                    int nlast  = sub_nodes.back();
 
-                // 修正：机制判定用"子链"端点，而非整条臂端点。
-                // 臂中段的螺型 run 两端都是 2 连通内点 -> Bulk；
-                // 只有真正抵达结的 run 端点 conn>2 -> Intersection。
-                MechanismType mechanism = Bulk;
-                if (network->conn[nfirst].num > 2 ||
-                    network->conn[nlast].num  > 2) {
-                    mechanism = Intersection;
+                    // 机制判定用"子链"端点，而非整条臂端点：
+                    // run 落在臂中间时两端都是 2 连通内点 -> Bulk；
+                    // 只有真正抵达结(conn>2)的 run 端点 -> Intersection。
+                    MechanismType mechanism = Bulk;
+                    if (network->conn[nfirst].num > 2 ||
+                        network->conn[nlast].num  > 2) {
+                        mechanism = Intersection;
+                    }
+
+                    ScrewChain chain;
+                    chain.node_ids    = sub_nodes;
+                    chain.seg_ids     = sub_segs;
+                    chain.burg        = burg;
+                    chain.glide_plane = run_plane;   // 用本 run 的实际面，而非整臂 plane0
+                    chain.mechanism   = mechanism;
+
+                    // Intersection：识别结臂与结类型。in_chain 判定用 sub_segs（本子链段表）。
+                    if (mechanism == Intersection) {
+                        int jnode = (network->conn[nfirst].num > 2) ? nfirst : nlast;
+
+                        Vec3 jburg(0.0);
+                        for (int a = 0; a < network->conn[jnode].num; a++) {
+                            int sk = network->conn[jnode].seg[a];
+                            bool in_chain = false;
+                            for (int sc : sub_segs) if (sc == sk) { in_chain = true; break; }
+                            if (!in_chain) {
+                                int ord = network->conn[jnode].order[a];
+                                jburg = jburg + ord * network->segs[sk].burg;
+                            }
+                        }
+                        chain.junction_burg = jburg;
+
+                        for (int a = 0; a < network->conn[jnode].num; a++) {
+                            int sk = network->conn[jnode].seg[a];
+                            bool in_chain = false;
+                            for (int sc : sub_segs) if (sc == sk) { in_chain = true; break; }
+                            if (!in_chain) {
+                                chain.junction_plane = network->segs[sk].plane;
+                                break;
+                            }
+                        }
+
+                        Vec3 jburg_crystal = system->crystal.Rinv * jburg.normalized();
+                        if (is_100_family(jburg_crystal)) {
+                            chain.junction = Hirth;
+                        } else if (is_110_family(jburg_crystal)) {
+                            Vec3 jplane_crystal = system->crystal.Rinv
+                                                 * chain.junction_plane.normalized();
+                            if (is_111_family(jplane_crystal)) {
+                                chain.junction = GlideLock;
+                            } else if (is_110_family(jplane_crystal) || is_100_family(jplane_crystal)) {
+                                chain.junction = LCLock;
+                            }
+                        } else {
+                            chain.junction = UnknownLock;
+                        }
+                    }
+
+                    chains.push_back(std::move(chain));
                 }
 
-                ScrewChain chain;
-                chain.node_ids    = sub_nodes;
-                chain.seg_ids     = sub_segs;
-                chain.burg        = burg;
-                chain.glide_plane = plane0;
-                chain.mechanism   = mechanism;
-
-                // Intersection：识别结臂与结类型。
-                // 注意 in_chain 判定用 sub_segs（本子链段表），不是整臂 ssegs。
-                if (mechanism == Intersection) {
-                    int jnode = (network->conn[nfirst].num > 2) ? nfirst : nlast;
-
-                    Vec3 jburg(0.0);
-                    for (int k = 0; k < network->conn[jnode].num; k++) {
-                        int sk = network->conn[jnode].seg[k];
-                        bool in_chain = false;
-                        for (int sc : sub_segs) if (sc == sk) { in_chain = true; break; }
-                        if (!in_chain) {
-                            int ord = network->conn[jnode].order[k];
-                            jburg = jburg + ord * network->segs[sk].burg;
-                        }
-                    }
-                    chain.junction_burg = jburg;
-
-                    for (int k = 0; k < network->conn[jnode].num; k++) {
-                        int sk = network->conn[jnode].seg[k];
-                        bool in_chain = false;
-                        for (int sc : sub_segs) if (sc == sk) { in_chain = true; break; }
-                        if (!in_chain) {
-                            chain.junction_plane = network->segs[sk].plane;
-                            break;
-                        }
-                    }
-
-                    Vec3 jburg_crystal = system->crystal.Rinv * jburg.normalized();
-                    if (is_100_family(jburg_crystal)) {
-                        chain.junction = Hirth;
-                    } else if (is_110_family(jburg_crystal)) {
-                        Vec3 jplane_crystal = system->crystal.Rinv
-                                             * chain.junction_plane.normalized();
-                        if (is_111_family(jplane_crystal)) {
-                            chain.junction = GlideLock;
-                        } else if (is_110_family(jplane_crystal) || is_100_family(jplane_crystal)) {
-                            chain.junction = LCLock;
-                        }
-                    } else {
-                        chain.junction = UnknownLock;
-                    }
-                }
-
-                chains.push_back(std::move(chain));
+                k = rend + 1;   // 跳过本 run；打断该 run 的那一段会在下一轮被重新检查
             }
         }
-        return chains;//返回构建好的所有满足条件的螺旋链列表 chains。每个链都包含了它的节点和段信息、Burgers 向量、滑移面法向、交滑移机制类型，以及如果是 Intersection 机制还包含了结的 Burgers 向量和滑移面等信息。这些信息将用于后续的应力计算和交滑移分析。 按合 Burgers 矢量的族 + 面的族把结分成 Hirth / Glide lock / LC lock。std::move 把 chain 的内部 vector 资源转移进容器，省一次深拷贝。
+        return chains;//返回所有子链：每条含 run 的节点/段、Burgers、本 run 的 {111} 面、机制，以及结信息。
     }
 
     // -----------------------------------------------------------------------
